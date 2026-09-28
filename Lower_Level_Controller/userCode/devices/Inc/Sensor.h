@@ -62,11 +62,25 @@ typedef struct Sensor_Site{
 
 struct PressureSample
 {
+    /*
+     * frame_id 表示已经完成的压力采样帧编号。
+     * GET_TEMPERATURE
+     * GET_PRESSURE
+     * CALCULATE完成一次+1   */
     uint32_t frame_id;
-    float pressure[SENSOR_NUM];
-    float depth;
-    float roll;
-    float pitch;
+    uint8_t valid_mask;// valid_mask 的第 i 位表示第 i 路水压计是否有效。TCA
+    float pressure_diff_mbar[SENSOR_NUM];//四路传感器相对于液面参考的压力差。单位是 mbar。
+    // 四路传感器的绝对压力,单位是 Pa, ESKF 后续使用这个字段。
+    float pressure_pa[SENSOR_NUM];
+    float depth_m[SENSOR_NUM];//单位：m
+    float mean_depth_m;//单位：m
+
+    /*
+     * 这两个量不是 ESKF 的姿态角，
+     * 只是旧版闭环控制使用的经验反馈量。
+     */
+    float legacy_roll_error_mbar;//mbar
+    float legacy_pitch_error_mbar;//mbar
 };
 enum class PS_HANDLE_STATE {
         GET_TEMPERATURE = 0X00,

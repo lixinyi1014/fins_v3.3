@@ -22,6 +22,7 @@
 #include "gpio.h"
 #include "UART_Base.h"
 #include "ControllerTask.h"
+#include "SensorTask.h"
 #include "FreeRTOS.h"
 #include "task.h"
 
@@ -215,9 +216,20 @@ int main(void) {
     for(int i = 0; i < DEVICE_NUM; ++i){
         device[i] -> Init();
     }
-    // * 设备初始化完成后，创建 ControllerTask。
-    // * 此时任务已经存在，但调度器还没有启动。
+    /*
+     * 先创建设备任务。
+     *
+     * 这个函数会创建：
+     * 1. ControllerTask
+     * 2. imu_queue
+     * 3. pressure_queue
+     */
     StartControllerTask(device, DEVICE_NUM);
+
+    /*
+     * 再创建负责读取传感器队列的 SensorTask。
+     */
+    StartSensorTask();
     // Set the initialization-complete flag.
     // 设置初始化完成标志,允许定时器中断开始通知任务
     system_init_flag = true;

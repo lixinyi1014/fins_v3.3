@@ -4,6 +4,7 @@
 
 #include "ControllerTask.h"
 #include "Sensor.h"
+#include "IMU.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -25,6 +26,9 @@ namespace
      */
     TaskHandle_t controller_task_handle = nullptr;
     QueueHandle_t pressure_queue = nullptr;
+    QueueHandle_t imu_queue = nullptr;
+    StaticQueue_t imu_queue_tcb;
+    uint8_t imu_queue_storage[8 * sizeof(ImuSample)];
 
     StaticQueue_t pressure_queue_tcb;
     uint8_t pressure_queue_storage[sizeof(PressureSample)];
@@ -58,6 +62,8 @@ namespace
          * FreeRTOS 任务不能执行一次就返回。
          * 所以使用无限循环。
          */
+        uint32_t last_pressure_frame = 0;
+        uint32_t last_imu_sequence = 0;
         for (;;)
         {
             /*
@@ -90,16 +96,53 @@ namespace
  * GET_TEMPERATURE、GET_PRESSURE 或 CALCULATE
  * 其中一个阶段。
  *
- * 只有 CALCULATE 阶段完成后，
+ * 只有初始化第一帧阶段完成后，
  * CopyLatestSample() 才会返回 true。
  */
-            PressureSample sample;
+            PressureSample sample = {};
 
             if (PressureSensor::pressure_sensor.CopyLatestSample(&sample))
             {
-                if (pressure_queue != nullptr)
+                if (sample.frame_id != last_pressure_frame)
                 {
-                    xQueueOverwrite(pressure_queue, &sample);
+                    if (pressure_queue != nullptr)
+                    {
+                        /*
+                         * 队列保存数据副本。
+                         * 长度为 1，新的帧替换尚未取走的旧帧。
+                         */
+                        xQueueOverwrite(pressure_queue, &sample);
+
+                        /*
+                         * 保存本次已经发布的帧号，
+                         * 供下次任务循环比较。
+                         */
+                        last_pressure_frame = sample.frame_id;
+                    }
+                }
+            }
+            ImuSample imu_sample = {};
+            if (IMU::imu.CopyLatestSample(&imu_sample))
+            {
+                if (imu_sample.sequence != last_imu_sequence)
+                {
+                    if (imu_queue != nullptr)
+                    {
+                        /*
+                         * timeout 为 0，表示这里不能因为等待队列阻塞控制任务。
+                         */
+                        if (xQueueSend(imu_queue, &imu_sample, 0) == pdPASS)
+                        {
+                            /*
+                             * 只有成功放入队列之后，
+                             * 才认为这个序号已经发布。
+                             *
+                             * 如果队列已满，暂时不修改 last_imu_sequence，
+                             * 下一个控制周期还会尝试发送。
+                             */
+                            last_imu_sequence = imu_sample.sequence;
+                        }
+                    }
                 }
             }
         }
@@ -143,6 +186,14 @@ void StartControllerTask(Device *devices[], uint32_t count)
 );
 
     configASSERT(pressure_queue != nullptr);
+    imu_queue = xQueueCreateStatic(
+    8,
+    sizeof(ImuSample),
+    imu_queue_storage,
+    &imu_queue_tcb
+);
+
+    configASSERT(imu_queue != nullptr);
     /*
      * 创建静态任务。
      *
@@ -219,6 +270,7 @@ bool WaitPressureSample(PressureSample *sample, uint32_t timeout_ms)
         return false;
     }
 
+
     if (pressure_queue == nullptr)
     {
         return false;
@@ -228,6 +280,30 @@ bool WaitPressureSample(PressureSample *sample, uint32_t timeout_ms)
 
     return xQueueReceive(
         pressure_queue,
+        sample,
+        wait_ticks
+    ) == pdPASS;
+}
+bool WaitImuSample(ImuSample *sample, uint32_t timeout_ms)
+{
+
+    if (sample == nullptr)
+    {
+        return false;
+    }
+
+    /*
+     * ControllerTask 创建完成之前，队列句柄为空。
+     */
+    if (imu_queue == nullptr)
+    {
+        return false;
+    }
+
+    TickType_t wait_ticks = pdMS_TO_TICKS(timeout_ms);
+
+    return xQueueReceive(
+        imu_queue,
         sample,
         wait_ticks
     ) == pdPASS;

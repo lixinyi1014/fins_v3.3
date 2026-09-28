@@ -87,18 +87,38 @@ bool PressureSensor::CopyLatestSample(PressureSample *sample) const
     if (sample == nullptr) return false;
     // frame_id 为 0 表示还没有完成过一次完整采样
     if (pressure_frame_id == 0) return false;
-
+    const float millibar_to_pa = 100.0f;
+    const float water_density = 1000.0f;//kg/m3
+    const float gravity = 9.80665f;//m/s2
+    const float pressure_to_depth = millibar_to_pa / water_density / gravity;
 
     sample->frame_id = pressure_frame_id;
-
+    sample->valid_mask = 0;
     for (int i = 0; i < SENSOR_NUM; ++i)
     {
-        sample->pressure[i] = data_pressure[i];
+        if (flag_ok[i]) {
+            sample->valid_mask |= static_cast<uint8_t>(1U << i);
+            sample->pressure_diff_mbar[i] = data_pressure[i];
+            sample->pressure_pa[i] = data_pressure_raw[i]*millibar_to_pa;
+            sample->depth_m[i] = data_pressure[i] * pressure_to_depth;
+        }
+        else
+        {
+            sample->pressure_diff_mbar[i] = 0.0f;
+            sample->pressure_pa[i] = 0.0f;
+            sample->depth_m[i] = 0.0f;
+        }
     }
 
-    sample->depth = data_depth;
-    sample->roll = data_roll;
-    sample->pitch = data_pitch;
+    sample->mean_depth_m =
+        data_depth * pressure_to_depth;
+
+    /*
+     * 这两个量是原版压力差组合值，
+     * 不是弧度制姿态角。
+     */
+    sample->legacy_roll_error_mbar = data_roll;
+    sample->legacy_pitch_error_mbar = data_pitch;
 
     return true;
 }
@@ -434,7 +454,6 @@ void PressureSensor::Handle_all()
  *
  * 三个阶段完成后，才算得到一帧完整的压力数据。
  */
-    switch (ps_state)
     switch (ps_state) {
         case PS_HANDLE_STATE::GET_TEMPERATURE:
             // Notify the sensor to prepare temperature data.

@@ -76,7 +76,15 @@ typedef struct IMU_Raw_Data{
 typedef struct IMU_Pro_Data{
     float accel[3], gyro[3], temp, mag[3], ins_quat[4], ins_angle[3];
 } IMU_Pro_Data_t;
-
+struct ImuSample{
+  //sequence表示已经处理好的数据帧，可以判断是否为新数据
+    uint32_t sequence;
+    uint32_t received_ms;//处理数据的时间，用来替换真正的采样时间
+    float gyro_[3];//rad/s
+    float accel_[3];//m/s2
+    float mag_[3];//uT
+    float temp_;//c
+};
 typedef struct IMU_Attitude{
     float yaw, pitch, roll;
     float yaw_v, pitch_v, roll_v;
@@ -95,7 +103,8 @@ typedef enum IMU_DMA_State{
     IMU_DMA_IDLE = 0,
     IMU_DMA_READ_GYRO,
     IMU_DMA_READ_ACCEL,
-    IMU_DMA_READ_TEMP
+    IMU_DMA_READ_TEMP,
+    IMU_DMA_FRAME_READY
 }IMU_DMA_State_e;
 
 typedef struct IMU_Position{
@@ -159,6 +168,8 @@ class IMU : public Device
     void IMU_temp_PWM(uint16_t pwm);
     //位移获取
     void attitude_update();
+    //处理新一轮imu数据，由handle调用，数据解码，温控，磁力计读取和姿态计算
+    void ProcessReceivedData();
 
 public:
 
@@ -166,6 +177,7 @@ public:
     void Handle();
     void Receive();
     void DMA_IT_Handle(void);
+    bool CopyLatestSample(ImuSample *sample) const;
 
 	static IMU imu;
     
@@ -176,7 +188,8 @@ public:
     IMU_Position_t position;
     IMU_Filter_t axFilter;
     IMU_Filter_t ayFilter;
-    IMU_DMA_State_e dma_state;
+    volatile IMU_DMA_State_e dma_state;//volatile指每次访问都需要读取或者写入整个变量
+    uint32_t sample_sequence = 0;
 };
 
 

@@ -14,10 +14,11 @@
 #include <stdint.h>
 #include "Usermain.h"
 struct PressureSample;
-
+struct ImuSample;
 void StartControllerTask(Device *devices[], uint32_t count);
 //这个函数由 TIM1 定时器中断调用。
 //它只负责通知任务，不负责执行设备处理。
 void ControllerTickFromISR(void);
 bool WaitPressureSample(PressureSample *sample, uint32_t timeout_ms);
+bool WaitImuSample(ImuSample *sample, uint32_t timeout_ms);
 #endif

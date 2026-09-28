@@ -48,6 +48,7 @@ list(APPEND SOURCES
         Middlewares/Third_Party/FreeRTOS/list.c
         Middlewares/Third_Party/FreeRTOS/portable/GCC/ARM_CM4F/port.c
         userCode/task/Src/ControllerTask.cpp
+        userCode/task/Src/SensorTask.cpp
 )
 
 include_directories(Inc Drivers/STM32F4xx_HAL_Driver/Inc Drivers/STM32F4xx_HAL_Driver/Inc/Legacy

@@ -59,9 +59,58 @@ void IMU::Init()
     SPI1_DMA_init((uint32_t)buf.gyro_dma_tx_buf, (uint32_t)buf.gyro_dma_rx_buf, SPI_DMA_GYRO_LENGHT);
 
     dma_state = IMU_DMA_IDLE;
-
+    sample_sequence = 0;
 }
+void IMU::ProcessReceivedData() {
+    //调用本函数的时候DMA三段读取完成，FRAME_READY状态
+    BMI088_gyro_read_over(
+    buf.gyro_dma_rx_buf + BMI088_GYRO_RX_BUF_DATA_OFFSET,
+    raw_data.gyro
+);
 
+    BMI088_accel_read_over(
+        buf.accel_dma_rx_buf + BMI088_ACCEL_RX_BUF_DATA_OFFSET,
+        raw_data.accel,
+        &raw_data.time
+    );
+
+    BMI088_temperature_read_over(
+        buf.accel_temp_dma_rx_buf + BMI088_ACCEL_RX_BUF_DATA_OFFSET,
+        &raw_data.temp
+    );
+    pro_data.temp = raw_data.temp;
+    imu_temp_control(raw_data.temp);
+    ist8310_read_mag(raw_data.mag);
+    offset_correction();
+    MahonyAHRSupdate(
+    pro_data.ins_quat,
+    pro_data.gyro[0],
+    pro_data.gyro[1],
+    pro_data.gyro[2],
+    pro_data.accel[0],
+    pro_data.accel[1],
+    pro_data.accel[2],
+    pro_data.mag[0],
+    pro_data.mag[1],
+    pro_data.mag[2]
+    );
+    /*
+ * 将四元数转换为原版使用的欧拉角。
+ *
+ * 当前数组顺序：
+ * ins_angle[0]：yaw
+ * ins_angle[1]：pitch
+ * ins_angle[2]：roll
+ */
+    get_angle(
+        pro_data.ins_quat,
+        &pro_data.ins_angle[0],
+        &pro_data.ins_angle[1],
+        &pro_data.ins_angle[2]
+    );
+    attitude_update();
+    ++sample_sequence;
+}
 void IMU::Handle()
 {
 		// Normal operation.
@@ -72,6 +121,13 @@ void IMU::Handle()
     // MahonyAHRSupdate(pro_data.ins_quat, pro_data.gyro[0], pro_data.gyro[1], pro_data.gyro[2], pro_data.accel[0], pro_data.accel[1], pro_data.accel[2], pro_data.mag[0], pro_data.mag[1], pro_data.mag[2]);    // Compute the quaternion from the acquired accelerometer, gyroscope, and magnetometer measurements, and update it in-place in the `quat` array. //对得到的加速度计、陀螺仪和磁力计数据进行计算得到四元数，直接在数组quat中更新
 	// // MahonyAHRSupdateIMU(pro_data.ins_quat, pro_data.gyro[0], pro_data.gyro[1], pro_data.gyro[2], pro_data.accel[0], pro_data.accel[1], pro_data.accel[2]);    // Compute the quaternion from the acquired accelerometer and gyroscope measurements, and update it in-place in the `quat` array. //对得到的加速度计、陀螺仪数据进行计算得到四元数，直接在数组quat中更新
 	// get_angle(pro_data.ins_quat, pro_data.ins_angle, pro_data.ins_angle+1, pro_data.ins_angle+2);    // Compute Euler angles (in radians) from the quaternion, and update them in-place in the `INS_angle` array. //对四元数计算得到弧度制欧拉角，直接在INS_angle数组中更新
+    if (dma_state == IMU_DMA_FRAME_READY)
+    {
+        // 数据内存屏障。保证后面的缓冲区读取位于状态确认之后。
+        __DMB();
+        ProcessReceivedData();
+        dma_state = IMU_DMA_IDLE;
+    }
 
 		// Enable DMA transfer for the IMU.
     // 开启IMU DMA传输
@@ -85,8 +141,32 @@ void IMU::Handle()
     //         send_float(pro_data.gyro[i], 2, 0);
     //     }
     // }
+    //---TODO:最终vofa发送压力，姿态，错误码
 }
+bool IMU::CopyLatestSample(ImuSample *sample) const
+{
 
+    if (sample == nullptr) return false;
+    if (sample_sequence == 0) return false;
+
+    /*
+     * 复制当前已经校正好的传感器数据。
+     * pro_data 中的数据由 ProcessReceivedData() 在任务上下文中更新。
+     */
+    sample->sequence = sample_sequence;
+    sample->received_ms = HAL_GetTick();
+
+    for (int i = 0; i < 3; ++i)
+    {
+        sample->gyro_[i] = pro_data.gyro[i];
+        sample->accel_[i] = pro_data.accel[i];
+        sample->mag_[i] = pro_data.mag[i];
+    }
+
+    sample->temp_ = pro_data.temp;
+
+    return true;
+}
 void IMU::Receive()
 {
     if (strncmp((char *)RxBuffer, "BEG", 3) == 0)
@@ -156,45 +236,25 @@ void IMU::DMA_IT_Handle()
             break;
         case IMU_DMA_READ_GYRO:
             HAL_GPIO_WritePin(CS1_GYRO_GPIO_Port, CS1_GYRO_Pin, GPIO_PIN_SET);
-            BMI088_gyro_read_over(buf.gyro_dma_rx_buf + BMI088_GYRO_RX_BUF_DATA_OFFSET, raw_data.gyro);
             dma_state = IMU_DMA_READ_ACCEL;
             trigger_accel_dma();
             break;
         case IMU_DMA_READ_ACCEL:
             HAL_GPIO_WritePin(CS1_ACCEL_GPIO_Port, CS1_ACCEL_Pin, GPIO_PIN_SET);
-            BMI088_accel_read_over(buf.accel_dma_rx_buf + BMI088_ACCEL_RX_BUF_DATA_OFFSET, raw_data.accel, &raw_data.time);
             dma_state = IMU_DMA_READ_TEMP;
             trigger_temp_dma();
             break;
         case IMU_DMA_READ_TEMP:
             HAL_GPIO_WritePin(CS1_ACCEL_GPIO_Port, CS1_ACCEL_Pin, GPIO_PIN_SET);
-            BMI088_temperature_read_over(buf.accel_temp_dma_rx_buf + BMI088_ACCEL_RX_BUF_DATA_OFFSET, &raw_data.temp);
-            imu_temp_control(raw_data.temp);
-            ist8310_read_mag(raw_data.mag);
-            offset_correction();
-            MahonyAHRSupdate(pro_data.ins_quat, pro_data.gyro[0], pro_data.gyro[1], pro_data.gyro[2], pro_data.accel[0], pro_data.accel[1], pro_data.accel[2], pro_data.mag[0], pro_data.mag[1], pro_data.mag[2]);    // Compute the quaternion from the acquired accelerometer, gyroscope, and magnetometer measurements, and update it in-place in the `quat` array. //对得到的加速度计、陀螺仪和磁力计数据进行计算得到四元数，直接在数组quat中更新
-            // MahonyAHRSupdateIMU(pro_data.ins_quat, pro_data.gyro[0], pro_data.gyro[1], pro_data.gyro[2], pro_data.accel[0], pro_data.accel[1], pro_data.accel[2]);   //Compute the quaternion from the acquired accelerometer and gyroscope measurements, and update it in-place in the `quat` array. //对得到的加速度计、陀螺仪数据进行计算得到四元数，直接在数组quat中更新
-            get_angle(pro_data.ins_quat, pro_data.ins_angle, pro_data.ins_angle+1, pro_data.ins_angle+2);    // Compute Euler angles (in radians) from the quaternion, and update them in-place in the `INS_angle` array. //对四元数计算得到弧度制欧拉角，直接在INS_angle数组中更新
-            attitude_update();
-            
-						// Output test
-						// 测试输出
-            if (PressureSensor::pressure_sensor.ps_state == PS_HANDLE_STATE::CALCULATE)
-            {
-            // send_float(pro_data.ins_angle[0]*180/PI, 2, 0);
-            // send_float(pro_data.ins_angle[1]*180/PI, 2, 0);
-            // send_float(pro_data.ins_angle[2]*180/PI, 2, 1);
-            // send_float(pro_data.accel[0], 2, 0);
-            // send_float(pro_data.accel[1], 2, 0);
-            // send_float(pro_data.accel[2], 2, 1);
-							for(int i=0; i<3;i++)
-							 {
-									 send_float(PressureSensor::pressure_sensor.data_pressure[i], 2, 0);
-							 }
-							 send_float(PressureSensor::pressure_sensor.data_pressure[3], 2, 1);
-            }
-            dma_state = IMU_DMA_IDLE;
+            __DMB();
+            dma_state = IMU_DMA_FRAME_READY;
             break;
+        case IMU_DMA_FRAME_READY:
+            break;
+        default:
+        {
+            break;
+        }
         }
     }
 }

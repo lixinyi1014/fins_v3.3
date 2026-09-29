@@ -500,7 +500,7 @@ void PressureSensor::Handle_all()
 
 						// Refer to `float PressureSensor::MS5837_30BA_GetData(int id)` to compute the four raw pressure values.
             // 参考float PressureSensor::MS5837_30BA_GetData(int id)计算四个原始压强
-            float pressure[4];
+            float pressure[SENSOR_NUM] = {};
             for (int i = 0; i < SENSOR_NUM; ++i)
             {
                 if (flag_ok[i])
@@ -533,15 +533,32 @@ void PressureSensor::Handle_all()
                 //     return -1;
             }
 
-				// Assign the raw pressures to `data_pressure_raw`, then compute and assign the processed values to `data_pressure`.
-        // 把原始压强赋值给data_pressure_raw，计算后给data_pressure赋值
-        for (int i = 0; i < SENSOR_NUM; ++i)
-        {
-            data_pressure_raw[i] = pressure[i];
-            tmp_pres = data_pressure_raw[i] - data_pressure_offset[i];
-            tmp_pres = Pressure_Kf[i].update(tmp_pres); // First-order low-pass filtering. // 一阶低通滤波
-            data_pressure[i] = tmp_pres;
-        }
+            /*
+             * 只有有效压力计才更新当前压力值。
+             *
+             * 无效通道保持上一帧结果，
+             * 这样不会破坏原有闭环控制接口。
+             */
+            for (int i = 0; i < SENSOR_NUM; ++i)
+            {
+                if (!flag_ok[i])
+                {
+                    continue;
+                }
+
+                data_pressure_raw[i] =
+                    pressure[i];
+
+                tmp_pres =
+                    data_pressure_raw[i] -
+                    data_pressure_offset[i];
+
+                tmp_pres =
+                    Pressure_Kf[i].update(tmp_pres);
+
+                data_pressure[i] =
+                    tmp_pres;
+            }
             ++pressure_frame_id;
             ps_state = PS_HANDLE_STATE::GET_TEMPERATURE;
             break;

@@ -3,6 +3,7 @@
 //
 #include "SensorTask.h"
 #include "ControllerTask.h"
+#include "AttitudeEskf.h"
 
 #include "IMU.h"
 #include "Sensor.h"
@@ -38,19 +39,33 @@ namespace
      *
      * 这里保存的是传感器输入，还不是 ESKF 的融合结果。
      */
+    struct BodyImuSample
+    {
+        float gyro_body[3];
+        float down_m_s2[3];
+        float mag_body[3];
+    };
     struct SensorTaskData
     {
+        uint32_t last_pressure_frame_id;
         ImuSample latest_imu;
         PressureSample latest_pressure;
 
         uint32_t imu_received_count;
         uint32_t pressure_received_count;
+        uint32_t last_imu_sequence;
 
         float accel_norm_m_s2;
         uint32_t gravity_sample_count;
         float gravity_sum;//m/s2
         float gravity;//m/s2
         bool gravity_ready;
+        FusionState fusion_state;
+        /*
+        * 保存当前最新一份已经转换到船体坐标的数据。
+        */
+        BodyImuSample body_imu;
+
     };
     /*
  * 启动时使用 200 帧加速度数据估计重力模长。
@@ -74,18 +89,57 @@ namespace
      * 这个对象只由 SensorTask 访问和修改。
      * 当前可以在调试器中查看，后续对外输出会提供独立接口。
      */
+    AttitudeEskf attitude_eskf;
     SensorTaskData sensor_data = {};
+    BodyImuSample ConvertImuToBody(const ImuSample &sample)
+    {
+        BodyImuSample converted = {};
 
+        converted.gyro_body[0] = sample.gyro_[0];
+        converted.gyro_body[1] = -sample.gyro_[1];
+        converted.gyro_body[2] = -sample.gyro_[2];
+
+        const float accel_body[3] =
+        {
+            sample.accel_[0],
+            -sample.accel_[1],
+            -sample.accel_[2]
+        };
+
+        converted.down_m_s2[0] = -accel_body[0];
+        converted.down_m_s2[1] = -accel_body[1];
+        converted.down_m_s2[2] = -accel_body[2];
+
+        converted.mag_body[0] = -sample.mag_[1];
+        converted.mag_body[1] = -sample.mag_[0];
+        converted.mag_body[2] = -sample.mag_[2];
+
+        return converted;
+    }
     void ProcessImuSample(const ImuSample &sample)
     {
+        if (sample.sequence == 0)
+        {
+            return;
+        }
+
+        /*
+         * 如果序号与上一帧相同，
+         * 说明这不是新的 IMU 数据。
+         */
+        if (sample.sequence == sensor_data.last_imu_sequence)
+        {
+            return;
+        }
         /*
          * 保存这次收到的完整 IMU 数据。
          *
          * 这是结构体复制，gyro_、accel_、mag_、temp_
          * 以及 sequence 等成员都会一起复制。
          */
+        sensor_data.last_imu_sequence = sample.sequence;
         sensor_data.latest_imu = sample;
-
+        sensor_data.body_imu = ConvertImuToBody(sample);
         /*
          * 记录本任务成功接收并处理过多少份 IMU 数据。
          * 这个数量不等于传感器的帧编号。
@@ -99,12 +153,12 @@ namespace
          * 这里只记录当前一帧的结果，还没有进行静止判断和多帧平均，
          * 因此这个值暂时不能当作已经标定好的 gravity。
          */
-        const float ax = sample.accel_[0];
-        const float ay = sample.accel_[1];
-        const float az = sample.accel_[2];
+        const float dx = sensor_data.body_imu.down_m_s2[0];
+        const float dy = sensor_data.body_imu.down_m_s2[1];
+        const float dz = sensor_data.body_imu.down_m_s2[2];
 
         sensor_data.accel_norm_m_s2 =
-            sqrtf(ax * ax + ay * ay + az * az);
+            sqrtf(dx * dx + dy * dy + dz * dz);
 
         /*
          * 系统启动阶段，根据多帧加速度模长估计重力。
@@ -150,32 +204,174 @@ namespace
         }
 
         /*
-         * 只有 gravity_ready 为 true 后，
-         * 才在这里加入 ESKF 的正式处理。
+         * 重力初始化完成后，使用当前静止加速度
+         * 对 ESKF 做第一次姿态粗对准。
          */
+        if (!attitude_eskf.IsInitialized())
+        {
+            /*
+             * 当前 received_ms 是 ControllerTask 复制数据的时间。
+             * 它暂时只用于让初始化接口拥有一个时间参数。
+             *
+             * 后续接入真正的 BMI088 传感器时间后，
+             * 这里必须替换成统一的 sample_us。
+             */
+            const uint32_t temporary_time_us =
+                sample.received_ms * 1000U;
+
+            if (attitude_eskf.Initialize(
+                sensor_data.body_imu.down_m_s2,
+                sensor_data.gravity,
+                temporary_time_us))
+            {
+                /*
+                 * 保存一次初始化后的融合状态，
+                 * 方便调试器查看姿态是否合理。
+                 */
+                sensor_data.fusion_state =
+                    attitude_eskf.State();
+            }
+
+            /*
+             * 初始化调用结束后，本帧不再执行其他融合步骤。
+             */
+            return;
+        }
+
+        /*
+         * 当前 received_ms 是 ControllerTask 复制数据的时间。
+         *
+         * 目前先把它转换成微秒，
+         * 作为陀螺仪预测的临时时间轴。
+         *
+         * 后续接入真正的 BMI088 采样时间后，
+         * 这里必须改成统一的 sample_us。
+         */
+        const uint32_t temporary_time_us =
+            sample.received_ms * 1000U;
+
+        /*
+         * 使用已经转换到船体坐标的陀螺仪数据，
+         * 对 ESKF 当前四元数进行一次预测。
+         */
+        if (attitude_eskf.PredictGyroscope(
+                sensor_data.body_imu.gyro_body,
+                temporary_time_us))
+        {
+            /*
+             * 第一步：陀螺仪把姿态向前预测。
+             *
+             * 陀螺仪擅长描述短时间旋转，
+             * 但长期积分会产生漂移。
+             */
+            attitude_eskf.CorrectAccelerometer(
+                sensor_data.body_imu.down_m_s2
+            );
+
+            /*
+             * 第二步：加速度计利用重力方向修正姿态。
+             *
+             * 如果当前存在明显平动，
+             * CorrectAccelerometer() 会拒绝本帧，
+             * 这时仍然保留陀螺仪预测结果。
+             */
+            sensor_data.fusion_state =
+                attitude_eskf.State();
+        }
     }
 
     void ProcessPressureSample(const PressureSample &sample)
     {
-        /*
-         * 保存本次收到的完整压力数据。
-         *
-         * 包括四路压力、有效通道掩码、深度和帧编号。
-         * 当前只是保存输入，没有再次调用压力传感器驱动。
-         */
-        sensor_data.latest_pressure = sample;
+        if (sample.frame_id == 0)
+        {
+            return;
+        }
+
+        if (sample.frame_id ==
+            sensor_data.last_pressure_frame_id)
+        {
+            return;
+        }
 
         /*
-         * 记录本任务实际接收到的压力帧数量。
-         * 队列长度为 1，尚未取出的旧帧可能被新帧覆盖，
-         * 因此接收数量不一定等于 frame_id。
+         * 保存原始快照供调试查看。
          */
+        sensor_data.latest_pressure =
+            sample;
+
+        float depth_sum = 0.0f;
+        uint32_t valid_count = 0;
+
+        for (uint32_t i = 0;
+             i < SENSOR_NUM;
+             ++i)
+        {
+            /*
+             * valid_mask 的第 i 位表示第 i 路压力计是否有效。
+             */
+            const uint8_t valid_bit =
+                static_cast<uint8_t>(1U << i);
+
+            if ((sample.valid_mask & valid_bit) == 0)
+            {
+                continue;
+            }
+
+            const float current_depth =
+                sample.depth_m[i];
+
+            /*
+             * 排除异常深度。
+             */
+            if (!isfinite(current_depth) ||
+                current_depth < -0.5f ||
+                current_depth > 100.0f)
+            {
+                continue;
+            }
+
+            depth_sum += current_depth;
+            ++valid_count;
+        }
+
+        /*
+         * 没有任何有效通道时，
+         * 当前压力帧不能更新深度。
+         */
+        if (valid_count == 0)
+        {
+            return;
+        }
+
+        float depth_m =
+            depth_sum /
+            static_cast<float>(valid_count);
+
+        /*
+         * 水面零偏可能得到很小的负值，
+         * 将其限制到 0 m。
+         */
+        if (depth_m < 0.0f)
+        {
+            depth_m = 0.0f;
+        }
+
+        if (!attitude_eskf.UpdateDepthEstimate(depth_m))
+        {
+            return;
+        }
+
+        sensor_data.last_pressure_frame_id =
+            sample.frame_id;
+
         ++sensor_data.pressure_received_count;
 
         /*
-         * 后续在这里接入压力观测处理。
-         * 压力姿态修正与深度估计会在这里连接到融合算法。
+         * 重新读取统一融合状态。
+         * 其中包括姿态、陀螺仪零偏和深度。
          */
+        sensor_data.fusion_state =
+            attitude_eskf.State();
     }
 
     void SensorTask(void *argument)

@@ -52,8 +52,8 @@
 #define configMAX_SYSCALL_INTERRUPT_PRIORITY    (5U << 4U)
 
 /* FreeRTOS 异常入口映射 */
-// #define vPortSVCHandler                         SVC_Handler
-// #define xPortPendSVHandler                      PendSV_Handler
+#define vPortSVCHandler                         SVC_Handler
+#define xPortPendSVHandler                      PendSV_Handler
 
 /* 暂时停在死循环，最后再接 VOFA 错误码 */
 #define configASSERT(condition) \

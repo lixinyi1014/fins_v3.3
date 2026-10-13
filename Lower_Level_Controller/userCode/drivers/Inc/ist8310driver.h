@@ -37,5 +37,5 @@ typedef struct ist8310_real_data_t
 
 extern uint8_t ist8310_init(void);
 extern void ist8310_read_over(uint8_t *status_buf, ist8310_real_data_t *mpu6500_real_data);
-extern void ist8310_read_mag(float mag[3]);
+extern uint8_t ist8310_read_mag(float mag[3]); // 0=成功；失败时不修改 mag
 #endif

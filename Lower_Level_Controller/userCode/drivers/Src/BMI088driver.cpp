@@ -3,7 +3,7 @@
 #include "BMI088Middleware.h"
 
 
-float BMI088_ACCEL_SEN = BMI088_ACCEL_6G_SEN;
+float BMI088_ACCEL_SEN = BMI088_ACCEL_3G_SEN; // 与 bmi088_accel_init() 写入的 BMI088_ACC_RANGE_3G 一致（原来误用 6G 灵敏度，读数大一倍）
 float BMI088_GYRO_SEN = BMI088_GYRO_2000_SEN;
 
 

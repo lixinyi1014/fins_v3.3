@@ -122,6 +122,7 @@ class PressureSensor: public  Device{
     uint32_t D1_Pres,D2_Temp;
     uint32_t pressure_frame_id = 0;
     unsigned char flag_ok[6];
+    uint8_t pressure_valid_mask_ = 0;
     
     int32_t CurrentID;
 
@@ -151,6 +152,7 @@ public:
     static PressureSensor pressure_sensor;
     PS_HANDLE_STATE ps_state = PS_HANDLE_STATE::GET_TEMPERATURE;
     uint32_t GetPressureFrameID() const {return pressure_frame_id;};
+    uint8_t ValidMask() const {return pressure_valid_mask_;}
     bool CopyLatestSample(PressureSample *sample) const;
 };
 

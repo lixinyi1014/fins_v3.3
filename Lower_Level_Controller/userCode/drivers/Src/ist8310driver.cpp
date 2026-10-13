@@ -93,11 +93,13 @@ void ist8310_read_over(uint8_t *status_buf, ist8310_real_data_t *ist8310_real_da
     }
 }
 
-void ist8310_read_mag(float mag[3])
+uint8_t ist8310_read_mag(float mag[3])
 {
     uint8_t buf[6];
     int16_t temp_ist8310_data = 0;
-    ist8310_IIC_read_muli_reg(0x03, buf, 6);
+    // 读取失败时不修改 mag，调用者沿用上一次成功的数据；返回 0 表示成功
+    if (ist8310_IIC_read_muli_reg_status(0x03, buf, 6) != 0)
+        return 1;
 
     temp_ist8310_data = (int16_t)((buf[1] << 8) | buf[0]);
     mag[0] = MAG_SEN * temp_ist8310_data;
@@ -105,4 +107,5 @@ void ist8310_read_mag(float mag[3])
     mag[1] = MAG_SEN * temp_ist8310_data;
     temp_ist8310_data = (int16_t)((buf[5] << 8) | buf[4]);
     mag[2] = MAG_SEN * temp_ist8310_data;
+    return 0;
 }

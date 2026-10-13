@@ -32,7 +32,7 @@
 #define configUSE_IDLE_HOOK                     0
 #define configUSE_TICK_HOOK                     0
 #define configUSE_NEWLIB_REENTRANT              0
-#define configCHECK_FOR_STACK_OVERFLOW          0
+#define configCHECK_FOR_STACK_OVERFLOW          2   /* 栈溢出时进入 vApplicationStackOverflowHook，报 907 */
 
 /* 任务通知 */
 #define configUSE_TASK_NOTIFICATIONS            1
@@ -55,12 +55,21 @@
 #define vPortSVCHandler                         SVC_Handler
 #define xPortPendSVHandler                      PendSV_Handler
 
-/* 暂时停在死循环，最后再接 VOFA 错误码 */
+/* 断言失败：上报 906（附文件名和行号），推进器尽力回中位后停在死循环。见 EventLog.h */
+#ifndef __ASSEMBLER__
+#ifdef __cplusplus
+extern "C" {
+#endif
+void Fins_AssertFailed(const char *file, int line) __attribute__((noreturn));
+#ifdef __cplusplus
+}
+#endif
+#endif
 #define configASSERT(condition) \
     do { \
         if (!(condition)) { \
-            for (;;) {} \
+            Fins_AssertFailed(__FILE__, __LINE__); \
         } \
     } while (0)
 
-#endif
+#endif

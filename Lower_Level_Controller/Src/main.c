@@ -236,6 +236,9 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
+  /* 与原来一样不停机、直接返回，但上报 212 和调用处地址（用 .map 文件查是哪个初始化函数） */
+  extern void Fins_ErrorHandlerHit(uint32_t caller);
+  Fins_ErrorHandlerHit((uint32_t)__builtin_return_address(0));
 
   /* USER CODE END Error_Handler_Debug */
 }

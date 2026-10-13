@@ -21,4 +21,15 @@ void StartControllerTask(Device *devices[], uint32_t count);
 void ControllerTickFromISR(void);
 bool WaitPressureSample(PressureSample *sample, uint32_t timeout_ms);
 bool WaitImuSample(ImuSample *sample, uint32_t timeout_ms);
+/*
+ * 串口命令接收：中断里只把收到的数据放进缓冲（不解析），
+ * 控制任务每个周期开头统一取出、按行拆分、交给各设备 Receive()。
+ * 这样命令解析与 Handle() 在同一个任务里顺序执行，不会互相打断。
+ */
+bool CommandQueue_PushFromISR(const uint8_t *data, uint16_t length);
+/*
+ * 距离上一次收到上位机任何数据已经过去多少个控制周期（150 Hz）。
+ * 推进器模块用它做心跳检查。
+ */
+uint32_t CommandSilentCycles(void);
 #endif

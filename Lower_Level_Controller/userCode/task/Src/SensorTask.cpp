@@ -7,14 +7,14 @@
 
 #include "IMU.h"
 #include "Sensor.h"
+#include "EventLog.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
 
 #include <math.h>
 
-namespace
-{
+namespace {
     /*
      * 保存 SensorTask 的任务句柄。
      * 创建成功以后，句柄指向 FreeRTOS 管理的任务对象。
@@ -65,6 +65,7 @@ namespace
         * 保存当前最新一份已经转换到船体坐标的数据。
         */
         BodyImuSample body_imu;
+        uint8_t pressure_usable_mask;
 
     };
     /*
@@ -91,6 +92,19 @@ namespace
      */
     AttitudeEskf attitude_eskf;
     SensorTaskData sensor_data = {};
+
+    /*
+     * 写入对外发布的融合状态。
+     * 控制任务（优先级更高）随时可能打断本任务读取，
+     * 所以写端和读端（GetFusionState）都要在临界区里整体复制。
+     */
+    void PublishFusionState()
+    {
+        const FusionState state = attitude_eskf.State();
+        taskENTER_CRITICAL();
+        sensor_data.fusion_state = state;
+        taskEXIT_CRITICAL();
+    }
     BodyImuSample ConvertImuToBody(const ImuSample &sample)
     {
         BodyImuSample converted = {};
@@ -228,8 +242,9 @@ namespace
                  * 保存一次初始化后的融合状态，
                  * 方便调试器查看姿态是否合理。
                  */
-                sensor_data.fusion_state =
-                    attitude_eskf.State();
+                PublishFusionState();
+                Event_Post(EV_INFO_ESKF_READY,
+                           static_cast<int32_t>(sensor_data.gravity * 1000.0f));
             }
 
             /*
@@ -259,26 +274,42 @@ namespace
                 temporary_time_us))
         {
             /*
-             * 第一步：陀螺仪把姿态向前预测。
-             *
-             * 陀螺仪擅长描述短时间旋转，
-             * 但长期积分会产生漂移。
+             * 第一步：陀螺仪预测姿态。
+             */
+
+
+            /*
+             * 第二步：加速度计利用重力方向
+             * 修正 roll 和 pitch。
              */
             attitude_eskf.CorrectAccelerometer(
                 sensor_data.body_imu.down_m_s2
             );
 
             /*
-             * 第二步：加速度计利用重力方向修正姿态。
+             * 第三步：磁力计利用水平磁场方向
+             * 修正 yaw。
              *
-             * 如果当前存在明显平动，
-             * CorrectAccelerometer() 会拒绝本帧，
-             * 这时仍然保留陀螺仪预测结果。
+             * 当前观测无效时只跳过本次磁力计修正，
+             * 不改变已有 ESKF 状态，也不停止任务。
              */
-            sensor_data.fusion_state =
-                attitude_eskf.State();
+            const bool magnetometer_accepted =
+                attitude_eskf.CorrectMagnetometer(
+                    sensor_data.body_imu.mag_body
+                );
+
+            (void)magnetometer_accepted;
+
+            /*
+             * 第四步：保存本帧最终融合状态。
+             */
+            PublishFusionState();
         }
+
     }
+
+
+
 
     void ProcessPressureSample(const PressureSample &sample)
     {
@@ -298,7 +329,7 @@ namespace
          */
         sensor_data.latest_pressure =
             sample;
-
+        sensor_data.pressure_usable_mask = 0;
         float depth_sum = 0.0f;
         uint32_t valid_count = 0;
 
@@ -323,13 +354,11 @@ namespace
             /*
              * 排除异常深度。
              */
-            if (!isfinite(current_depth) ||
-                current_depth < -0.5f ||
-                current_depth > 100.0f)
+            if (!isfinite(current_depth))
             {
                 continue;
             }
-
+            sensor_data.pressure_usable_mask |= valid_bit;
             depth_sum += current_depth;
             ++valid_count;
         }
@@ -361,6 +390,9 @@ namespace
             return;
         }
 
+        const bool pressure_accepted = attitude_eskf.CorrectPressure(sample.depth_m,sensor_data.pressure_usable_mask);
+        (void)pressure_accepted;
+
         sensor_data.last_pressure_frame_id =
             sample.frame_id;
 
@@ -370,8 +402,7 @@ namespace
          * 重新读取统一融合状态。
          * 其中包括姿态、陀螺仪零偏和深度。
          */
-        sensor_data.fusion_state =
-            attitude_eskf.State();
+        PublishFusionState();
     }
 
     void SensorTask(void *argument)
@@ -414,34 +445,69 @@ namespace
             }
         }
     }
-}
 
-/*
- * 对外提供的任务创建函数。
- * Usermain.cpp 通过这个函数创建 SensorTask。
- */
-void StartSensorTask()
-{
+} // namespace（以下两个函数是 SensorTask.h 里声明的全局函数，不能放在匿名命名空间里）
+
     /*
-     * 创建静态任务。
+     * 复制当前最新的 ESKF 融合状态。
      *
-     * SensorTask 是任务入口函数。
-     * "sensor_task" 是调试器中显示的任务名称。
-     * 1024 是任务栈的元素数量。
-     * nullptr 表示不传递额外参数。
+     * SensorTask 会修改 sensor_data.fusion_state，
+     * ControllerTask 中的推进器控制会读取这份状态。
      *
-     * 当前使用优先级 2，低于 ControllerTask 的优先级 3。
-     * 两个任务同时就绪时，ControllerTask 优先运行。
+     * FusionState 包含多个 float 和数组，
+     * 不能让另一个任务在复制过程中读到一半旧数据、一半新数据。
+     * 因此复制时暂时进入 FreeRTOS 临界区。
      */
-    sensor_task_handle = xTaskCreateStatic(
-        SensorTask,
-        "sensor_task",
-        1024,
-        nullptr,
-        2,
-        sensor_task_stack,
-        &sensor_task_tcb
-    );
+    bool GetFusionState(FusionState *state)
+    {
+        if (state == nullptr)
+        {
+            return false;
+        }
 
-    configASSERT(sensor_task_handle != nullptr);
-}
+        taskENTER_CRITICAL();
+
+        /*
+         * 这里是结构体整体复制，
+         * quaternion、gyro_bias、euler_rad、
+         * gravity、depth、sequence 和 initialized
+         * 会一起复制到调用者提供的对象中。
+         */
+        *state = sensor_data.fusion_state;
+
+        taskEXIT_CRITICAL();
+
+        /*
+         * 返回复制出来的状态是否已经完成初始化。
+         */
+        return state->initialized;
+    }
+    /*
+     * 对外提供的任务创建函数。
+     * Usermain.cpp 通过这个函数创建 SensorTask。
+     */
+    void StartSensorTask() {
+        /*
+         * 创建静态任务。
+         *
+         * SensorTask 是任务入口函数。
+         * "sensor_task" 是调试器中显示的任务名称。
+         * 1024 是任务栈的元素数量。
+         * nullptr 表示不传递额外参数。
+         *
+         * 当前使用优先级 2，低于 ControllerTask 的优先级 3。
+         * 两个任务同时就绪时，ControllerTask 优先运行。
+         */
+        sensor_task_handle = xTaskCreateStatic(
+            SensorTask,
+            "sensor_task",
+            1024,
+            nullptr,
+            2,
+            sensor_task_stack,
+            &sensor_task_tcb
+        );
+
+        configASSERT(sensor_task_handle != nullptr);
+    }
+// 原来这里的 } 是匿名命名空间的结尾，已移到 GetFusionState 之前

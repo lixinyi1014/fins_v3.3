@@ -124,6 +124,8 @@ LoopFillZerobss:
     .section  .text.Default_Handler,"ax",%progbits
 Default_Handler:
 Infinite_Loop:
+  /* 进入了没有处理函数的中断：上报 905（IRQ 编号）后停住，见 EventLog.h */
+  b  Fins_UnhandledIrq
   b  Infinite_Loop
   .size  Default_Handler, .-Default_Handler
 /******************************************************************************

@@ -75,7 +75,7 @@ extern void xPortSysTickHandler(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
+extern void Fins_FaultReport(uint16_t code, uint32_t exc_return);
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
@@ -121,7 +121,7 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+  Fins_FaultReport(901, (uint32_t)__builtin_return_address(0)); /* 上报 901，见 EventLog.h */
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {
@@ -136,7 +136,7 @@ void HardFault_Handler(void)
 void MemManage_Handler(void)
 {
   /* USER CODE BEGIN MemoryManagement_IRQn 0 */
-
+  Fins_FaultReport(902, (uint32_t)__builtin_return_address(0)); /* 上报 902，见 EventLog.h */
   /* USER CODE END MemoryManagement_IRQn 0 */
   while (1)
   {
@@ -151,7 +151,7 @@ void MemManage_Handler(void)
 void BusFault_Handler(void)
 {
   /* USER CODE BEGIN BusFault_IRQn 0 */
-
+  Fins_FaultReport(903, (uint32_t)__builtin_return_address(0)); /* 上报 903，见 EventLog.h */
   /* USER CODE END BusFault_IRQn 0 */
   while (1)
   {
@@ -166,7 +166,7 @@ void BusFault_Handler(void)
 void UsageFault_Handler(void)
 {
   /* USER CODE BEGIN UsageFault_IRQn 0 */
-
+  Fins_FaultReport(904, (uint32_t)__builtin_return_address(0)); /* 上报 904，见 EventLog.h */
   /* USER CODE END UsageFault_IRQn 0 */
   while (1)
   {

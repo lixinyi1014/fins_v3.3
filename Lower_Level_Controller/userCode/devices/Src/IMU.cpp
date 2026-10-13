@@ -7,6 +7,7 @@
 #include "UART_Base.h"
 #include "Sensor.h"
 #include "Usermain.h"
+#include "EventLog.h"
 
 IMU IMU::imu;
 
@@ -15,11 +16,14 @@ bool is_output_angle = 0;
 
 void IMU::Init()
 {
-    if (BMI088_init() != BMI088_NO_ERROR)
-        Error_Handler();
+    // 初始化失败：保持原来"继续运行"的行为，但上报各自的编号
+    const uint8_t bmi088_error = BMI088_init();
+    if (bmi088_error != BMI088_NO_ERROR)
+        Event_Post(EV_WARN_BMI088_INIT, bmi088_error);
 #ifdef IMU_USE_MAG
-    if (ist8310_init() != IST8310_NO_ERROR)
-        Error_Handler();
+    const uint8_t ist8310_error = ist8310_init();
+    if (ist8310_error != IST8310_NO_ERROR)
+        Event_Post(EV_WARN_IST8310_INIT, ist8310_error);
 #endif
     // BMI088_read(raw_data.gyro, raw_data.accel, &raw_data.temp);
 		
@@ -50,12 +54,13 @@ void IMU::Init()
     raw_data.gyro_offset[0] = 0.0f;
     raw_data.gyro_offset[1] = 0.0f;
     raw_data.gyro_offset[2] = 0.0f;
-    raw_data.accel_offset[0] = 0.07f;
-    raw_data.accel_offset[1] = -0.17f;
+    // 原值 0.07 / -0.17 是在误用 6G 灵敏度（读数×2）时整定的，换成正确的 3G 灵敏度后减半
+    raw_data.accel_offset[0] = 0.035f;
+    raw_data.accel_offset[1] = -0.085f;
     raw_data.accel_offset[2] = 0.0f;
 
     if (HAL_SPI_Init(&hspi1) != HAL_OK)
-        Error_Handler();
+        Event_Post(EV_WARN_IMU_SPI_INIT, 0);
     SPI1_DMA_init((uint32_t)buf.gyro_dma_tx_buf, (uint32_t)buf.gyro_dma_rx_buf, SPI_DMA_GYRO_LENGHT);
 
     dma_state = IMU_DMA_IDLE;
@@ -80,7 +85,9 @@ void IMU::ProcessReceivedData() {
     );
     pro_data.temp = raw_data.temp;
     imu_temp_control(raw_data.temp);
-    ist8310_read_mag(raw_data.mag);
+    // 读失败时 raw_data.mag 保持上一次成功的值
+    if (ist8310_read_mag(raw_data.mag) != 0)
+        Event_PostLimited(EV_WARN_MAG_READ, 0, 1000);
     offset_correction();
     MahonyAHRSupdate(
     pro_data.ins_quat,

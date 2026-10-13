@@ -122,6 +122,21 @@ private:
     ExtensionResult init_result_ = ExtensionResult::I2cError;
     static Propeller_Command_t propeller_command[];
 
+    /*
+     * 安全检查：同一项检查连续失败 kFailLimit 个控制周期（150 Hz，约 0.67 s）才停机。
+     * 每项检查第一次失败时先上报一条警告。
+     */
+    static constexpr uint32_t kFailLimit = 100;
+    uint32_t nan_vertical_streak_ = 0;
+    uint32_t nan_horizontal_streak_ = 0;
+    uint32_t pca_fail_streak_ = 0;
+    uint32_t tca_fail_streak_ = 0;
+    uint16_t stop_code_ = 0;        // 最近一次停机原因（EventLog.h 1xx），重新 ON/TES 后清零
+    bool yaw_from_fusion_ = false;  // 偏航闭环的目标和反馈来自 ESKF（true）还是旧 IMU（false），二者不混用
+    void TrackFailure(bool ok, uint32_t &streak, uint16_t warn_code, uint16_t stop_code, int32_t arg);
+    void ResetVerticalControl();
+    void ResetHorizontalControl();
+
 public:
     void Init();
     void Handle();
@@ -133,6 +148,17 @@ public:
     ExtensionResult InitResult() const {return init_result_;}
 
     bool IsReady() const {return init_result_ == ExtensionResult::Ok;}
+
+    /* 停机：推进器全部回中位、关闭所有闭环并锁存，需重新 ON / TES。code 见 EventLog.h。 */
+    void Stop(uint16_t code, int32_t arg);
+    /* 推进器当前是否可能在出力（闭环开启或有非中位输出）。 */
+    bool IsActive() const;
+    /* 状态行字段，供 EventLog 的 $ST 使用。 */
+    int FormatStatusFields(char *buf, int size);
+    /* 曲线字段，供 EventLog 的 $PL 使用（姿态、角速度及其目标、深度、各通道控制量）。 */
+    int FormatPlotFields(char *buf, int size);
+    /* 致命错误时由 EventLog 调用：尽力把 8 路推进器写回中位。 */
+    void FatalNeutral();
 };
 
 

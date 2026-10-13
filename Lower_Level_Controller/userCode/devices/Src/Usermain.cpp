@@ -23,6 +23,7 @@
 #include "UART_Base.h"
 #include "ControllerTask.h"
 #include "SensorTask.h"
+#include "EventLog.h"
 #include "FreeRTOS.h"
 #include "task.h"
 
@@ -66,7 +67,8 @@ static Device *device[] = {
 
 volatile bool system_init_flag = false;
 volatile bool tick_300hz = false;
-uint8_t RxBuffer[SERIAL_LENGTH_MAX] = {0};
+uint8_t RxBuffer[SERIAL_LENGTH_MAX] = {0};      // 各设备 Receive() 解析用（只在控制任务里写）
+static uint8_t uart_rx_buffer[SERIAL_LENGTH_MAX] = {0}; // USART6 中断接收专用缓冲
 volatile uint8_t key_raw_state = 1;
 uint32_t key_last_stamp;
 volatile int32_t time_start = 0, time_end = 0, time_interval = 0, cnt = 0;
@@ -87,26 +89,34 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t datasize)//HAL_UART_RxCpltCallback
 {
     if(huart->Instance==USART6) {
-        // if (datasize >= 2){
-            // if (strncmp((char *)RxBuffer, "IM", 2) == 0)
-            //     device[0]->Receive();
-            // else if (strncmp((char *)RxBuffer, "PS", 2) == 0)
-            //     device[1]->Receive();
-            // else if (strncmp((char *)RxBuffer, "PR", 2) == 0)
-            //     device[2]->Receive();
-            // else if (strncmp((char *)RxBuffer, "SE", 2) == 0)
-            //     device[3]->Receive();
-            // else if (strncmp((char *)RxBuffer, "LE", 2) == 0)
-            //     device[4]->Receive();
-            for(int i=0;i<DEVICE_NUM;++i){
-                device[i]->Receive();
-            // }
+        /*
+         * 中断里不再解析命令（原来在这里直接调用各设备 Receive()，
+         * 其中 ACL:ON 会在中断里进 FreeRTOS 临界区导致整机卡死）。
+         * 现在只把数据放进缓冲，由控制任务在下一个周期开头统一解析。
+         */
+        if (datasize > 0 && !CommandQueue_PushFromISR(uart_rx_buffer, datasize))
+        {
+            Event_PostLimited(EV_WARN_CMD_OVERFLOW, datasize, 1000);
         }
-        
-        std::memset(RxBuffer, 0, SERIAL_LENGTH_MAX);
         // Re-enable UART reception.
-				// 重新开启接收
-        HAL_UARTEx_ReceiveToIdle_IT(&huart6, RxBuffer, SERIAL_LENGTH_MAX);
+        // 重新开启接收
+        HAL_UARTEx_ReceiveToIdle_IT(&huart6, uart_rx_buffer, SERIAL_LENGTH_MAX);
+    }
+}
+
+/*
+ * 串口错误回调：溢出(ORE)时 HAL 会中止接收，这里重新开启，
+ * 否则一次溢出之后就再也收不到命令。
+ */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART6)
+    {
+        Event_PostLimited(EV_WARN_UART_RX_ERROR, static_cast<int32_t>(huart->ErrorCode), 1000);
+        if (huart->RxState == HAL_UART_STATE_READY)
+        {
+            HAL_UARTEx_ReceiveToIdle_IT(&huart6, uart_rx_buffer, SERIAL_LENGTH_MAX);
+        }
     }
 }
 
@@ -121,8 +131,11 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
             }                                             \
         } while (0)
 
+    if (huart == &huart6) {
+        Telemetry_OnTxDone(); // USART6 由事件/遥测模块统一发送
+        return;
+    }
     HANDLE_UART_TX(1);
-    HANDLE_UART_TX(6);
 
     #undef HANDLE_UART_TX
     // if(huart == &huart1) {
@@ -159,6 +172,14 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
 // Entry point of the main function.
 // 主函数入口
 int main(void) {
+    /*
+     * 复位原因（RCC->CSR 高 8 位），随上电事件一起上报，
+     * 方便区分正常上电、复位键、欠压复位（推进器大电流拉低电压时常见）等。
+     */
+    const uint32_t reset_flags = RCC->CSR >> 24;
+    RCC->CSR |= RCC_CSR_RMVF;
+    Event_Post(EV_INFO_BOOT, static_cast<int32_t>(reset_flags));
+
     /* MCU Configuration--------------------------------------------------------*/
 
     /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
@@ -230,12 +251,20 @@ int main(void) {
      * 再创建负责读取传感器队列的 SensorTask。
      */
     StartSensorTask();
+
+    /*
+     * 所有设备初始化完成后再开启串口接收（原来分散在推进器、舵机的 Init 里）。
+     */
+    HAL_UARTEx_ReceiveToIdle_IT(&huart6, uart_rx_buffer, SERIAL_LENGTH_MAX);
+
     // Set the initialization-complete flag.
     // 设置初始化完成标志,允许定时器中断开始通知任务
     system_init_flag = true;
     time_start = HAL_GetTick();
     // 启动FreeRTOS调度器，正常情况下这个函数不会返回
     vTaskStartScheduler();
+    // 正常情况下不会执行到这里
+    Fins_Fatal(EV_FATAL_SCHEDULER_EXIT, 0, nullptr);
 }
 void send_float(float value, uint8_t decimalPlaces, bool endSign){
     bool isNegative = 0;
@@ -282,7 +311,7 @@ void send_float(float value, uint8_t decimalPlaces, bool endSign){
     buffer_float[len] = '\0';
 
     // HAL_UART_Transmit(&huart6, (uint8_t *)buffer, len, 0x00ff);
-    UARTBaseLite<6>::GetInstance().Transmit(reinterpret_cast<uint8_t *>(buffer_float),len);
+    Telemetry_Write(buffer_float, len);
 }
 
 void send_int(int32_t value, bool endSign){
@@ -310,5 +339,5 @@ void send_int(int32_t value, bool endSign){
 
     buffer_int[len] = '\0';
     // HAL_UART_Transmit(&huart6, (uint8_t *)buffer, len, 0x00ff);
-    UARTBaseLite<6>::GetInstance().Transmit(reinterpret_cast<uint8_t *>(buffer_int),len);
+    Telemetry_Write(buffer_int, len);
 }

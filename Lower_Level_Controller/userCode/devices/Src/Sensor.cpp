@@ -1,5 +1,6 @@
 #include "Sensor.h"
 #include "Kalman_filter.h"
+#include "EventLog.h"
 
 extern I2C_HandleTypeDef hi2c2;
 
@@ -45,6 +46,7 @@ void PressureSensor::Init()
     flag_read_pres = false;
 
     pressure_frame_id = 0;
+    pressure_valid_mask_ = 0;
     /*quat[0]=1.0f;
     quat[1]=0.0f;
     quat[2]=0.0f;
@@ -82,44 +84,87 @@ void PressureSensor::Receive()
     if (strncmp((char *)RxBuffer, "CA", 2) == 0) flag_calibrate = true;
     else if (strncmp((char *)RxBuffer, "VA", 2) == 0) flag_read_pres = true;
 }
-bool PressureSensor::CopyLatestSample(PressureSample *sample) const
+bool PressureSensor::CopyLatestSample(
+    PressureSample *sample) const
 {
-    if (sample == nullptr) return false;
-    // frame_id 为 0 表示还没有完成过一次完整采样
-    if (pressure_frame_id == 0) return false;
-    const float millibar_to_pa = 100.0f;
-    const float water_density = 1000.0f;//kg/m3
-    const float gravity = 9.80665f;//m/s2
-    const float pressure_to_depth = millibar_to_pa / water_density / gravity;
+    if (sample == nullptr)
+    {
+        return false;
+    }
 
+    if (pressure_frame_id == 0)
+    {
+        return false;
+    }
+
+    const float millibar_to_pa = 100.0f;
+    const float water_density = 1000.0f;
+    const float gravity = 9.80665f;
+
+    const float pressure_to_depth =
+        millibar_to_pa / (water_density * gravity);
+
+    /*
+     * 帧号和有效掩码都来自最近完成的 CALCULATE 阶段。
+     *
+     * 这里直接复制本帧检查结果，
+     * 不再根据初始化时的 flag_ok 重新生成掩码。
+     */
     sample->frame_id = pressure_frame_id;
-    sample->valid_mask = 0;
+    sample->valid_mask = pressure_valid_mask_;
+
     for (int i = 0; i < SENSOR_NUM; ++i)
     {
-        if (flag_ok[i]) {
-            sample->valid_mask |= static_cast<uint8_t>(1U << i);
-            sample->pressure_diff_mbar[i] = data_pressure[i];
-            sample->pressure_pa[i] = data_pressure_raw[i]*millibar_to_pa;
-            sample->depth_m[i] = data_pressure[i] * pressure_to_depth;
+        const uint8_t current_bit =
+            static_cast<uint8_t>(1U << i);
+
+        /*
+         * 只有本帧通过设备层检查的通道，
+         * 才向快照中复制对应读数。
+         */
+        if ((sample->valid_mask & current_bit) != 0)
+        {
+            sample->pressure_diff_mbar[i] =
+                data_pressure[i];
+
+            sample->pressure_pa[i] =
+                data_pressure_raw[i] * millibar_to_pa;
+
+            sample->depth_m[i] =
+                data_pressure[i] * pressure_to_depth;
         }
         else
         {
+            /*
+             * 无效通道的快照数值清零。
+             *
+             * 是否能使用这一通道，仍然由掩码决定。
+             * 这里的零不能被当作一次有效的水面测量。
+             */
             sample->pressure_diff_mbar[i] = 0.0f;
             sample->pressure_pa[i] = 0.0f;
             sample->depth_m[i] = 0.0f;
         }
     }
 
+    /*
+     * 保留已有快照字段的含义。
+     * 新的深度计算由 SensorTask 根据有效通道完成。
+     */
     sample->mean_depth_m =
         data_depth * pressure_to_depth;
 
-    /*
-     * 这两个量是原版压力差组合值，
-     * 不是弧度制姿态角。
-     */
-    sample->legacy_roll_error_mbar = data_roll;
-    sample->legacy_pitch_error_mbar = data_pitch;
+    sample->legacy_roll_error_mbar =
+        data_roll;
 
+    sample->legacy_pitch_error_mbar =
+        data_pitch;
+
+    /*
+     * true 表示成功复制了一份已完成的采样帧。
+     * 即使 valid_mask 为 0，也可以成功复制，
+     * 由任务层判断这一帧没有可用通道。
+     */
     return true;
 }
 void PressureSensor::Delay_us(uint32_t us)
@@ -327,12 +372,14 @@ void PressureSensor::Init_single(int id)
 
 void PressureSensor::Calibrate()
 {
+    Event_Post(EV_INFO_CALIB_START, 0);
     for (int i = 0; i < SENSOR_NUM; ++i)
     {
         TCA_SetChannel(i);
         // HAL_Delay(5);
         Calibrate_single(i);
     }
+    Event_Post(EV_INFO_CALIB_DONE, 0);
     // bsp_flash_write(&flashData);
 }
 
@@ -365,7 +412,10 @@ void PressureSensor::Calibrate_single(int id)
         TxBuffer[id * 9 + 8] = '\n';
     else
         TxBuffer[id * 9 + 8] = ',';
-    HAL_UART_Transmit(&huart6, TxBuffer, sizeof(TxBuffer), 0xffff);
+    // 原来用阻塞 HAL_UART_Transmit 输出，会和中断发送冲突；改为事件上报
+    static const char *const channel_names[SENSOR_NUM] = {"CH0", "CH1", "CH2", "CH3"};
+    Event_PostText(EV_INFO_CALIB_RESULT, static_cast<int32_t>(data_pressure_offset[id] * 1000.0f), channel_names[id]);
+    (void)TxBuffer;
 }
 
 void PressureSensor::OutputData()
@@ -435,75 +485,92 @@ void PressureSensor::Handle_all()
     static uint8_t command_pres = MS5837_30BA_D1_OSR1024;
     static uint8_t temp[3];
     static float tmp_pres;
-    static unsigned long conversion[8];    // The upper four bits of `conversion` store temperature data, and the lower four bits store pressure information. //conversion的前四位存储温度数据，后四位存储水压信息
+    static unsigned long conversion[8]; // The upper four bits of `conversion` store temperature data, and the lower four bits store pressure information. //conversion的前四位存储温度数据，后四位存储水压信息
     /*
- * ps_state 保存压力传感器当前所处的采样阶段。
- *
- * 每次调用 Handle_all() 只执行一个阶段：
- *
- * 1. GET_TEMPERATURE：
- *    启动四个传感器的温度转换。
- *
- * 2. GET_PRESSURE：
- *    读取上一阶段的温度结果，
- *    然后启动四个传感器的压力转换。
- *
- * 3. CALCULATE：
- *    读取压力转换结果，
- *    计算并滤波四个压力值。
- *
- * 三个阶段完成后，才算得到一帧完整的压力数据。
- */
+     * 本帧每一路是否所有 I2C 步骤都成功。
+     * 任何一步失败（选通、发命令、读数），这一路本帧作废，
+     * data_pressure 沿用上一次成功的值；conversion 也只在读成功时更新。
+     */
+    static bool channel_ok[SENSOR_NUM] = {};
+    static uint32_t fail_streak[SENSOR_NUM] = {};
+    /*
+     * ps_state 保存压力传感器当前所处的采样阶段。
+     *
+     * 每次调用 Handle_all() 只执行一个阶段：
+     *
+     * 1. GET_TEMPERATURE：
+     *    启动四个传感器的温度转换。
+     *
+     * 2. GET_PRESSURE：
+     *    读取上一阶段的温度结果，
+     *    然后启动四个传感器的压力转换。
+     *
+     * 3. CALCULATE：
+     *    读取压力转换结果，
+     *    计算并滤波四个压力值。
+     *
+     * 三个阶段完成后，才算得到一帧完整的压力数据。
+     */
     switch (ps_state) {
         case PS_HANDLE_STATE::GET_TEMPERATURE:
             // Notify the sensor to prepare temperature data.
-						// 告知传感器准备温度数据
+            // 告知传感器准备温度数据
             for (int i = 0; i < SENSOR_NUM; ++i)
             {
-                TCA_SetChannel(i);
-                HAL_I2C_Master_Transmit(&hi2c2, B02_IIC_ADDRESS, &command_tmp, 1, 1);
+                channel_ok[i] = TCA_SetChannel(i) == ExtensionResult::Ok &&
+                    HAL_I2C_Master_Transmit(&hi2c2, B02_IIC_ADDRESS, &command_tmp, 1, 1) == HAL_OK;
             }
             ps_state = PS_HANDLE_STATE::GET_PRESSURE;
             break;
 
         case PS_HANDLE_STATE::GET_PRESSURE:
             // Acquire temperature information.
-						// 收集温度信息
+            // 收集温度信息
             for (int i = 0; i < SENSOR_NUM; ++i)
             {
-                TCA_SetChannel(i);
-                HAL_I2C_Master_Transmit(&hi2c2, B02_IIC_ADDRESS, &data, 1, 1);
-                HAL_I2C_Master_Receive(&hi2c2, B02_IIC_ADDRESS, temp, 3, 1);
-                conversion[i] = (unsigned long)temp[0] * 65536 + (unsigned long)temp[1] * 256 + (unsigned long)temp[2];
+                const bool ok = TCA_SetChannel(i) == ExtensionResult::Ok &&
+                    HAL_I2C_Master_Transmit(&hi2c2, B02_IIC_ADDRESS, &data, 1, 1) == HAL_OK &&
+                    HAL_I2C_Master_Receive(&hi2c2, B02_IIC_ADDRESS, temp, 3, 1) == HAL_OK;
+                const unsigned long value = (unsigned long)temp[0] * 65536 + (unsigned long)temp[1] * 256 + (unsigned long)temp[2];
+                if (ok && value != 0)
+                    conversion[i] = value;  // 0 表示转换未完成，不算成功
+                else
+                    channel_ok[i] = false;
             }
 
-						// Notify the sensor to prepare pressure data.
+            // Notify the sensor to prepare pressure data.
             // 告知传感器准备压强数据
             for (int i = 0; i < SENSOR_NUM; ++i)
             {
-                TCA_SetChannel(i);
-                HAL_I2C_Master_Transmit(&hi2c2, B02_IIC_ADDRESS, &command_pres, 1, 1);
+                if (!(TCA_SetChannel(i) == ExtensionResult::Ok &&
+                      HAL_I2C_Master_Transmit(&hi2c2, B02_IIC_ADDRESS, &command_pres, 1, 1) == HAL_OK))
+                    channel_ok[i] = false;
             }
             ps_state = PS_HANDLE_STATE::CALCULATE;
             break;
 
         case PS_HANDLE_STATE::CALCULATE:
             // Retrieve the pressure readings.
-						// 获取压强数值
+            // 获取压强数值
             for (int i = 0; i < SENSOR_NUM; ++i)
             {
-                TCA_SetChannel(i);
-                HAL_I2C_Master_Transmit(&hi2c2, B02_IIC_ADDRESS, &data, 1, 1);
-                HAL_I2C_Master_Receive(&hi2c2, B02_IIC_ADDRESS, temp, 3, 1);
-                conversion[i+4] = (unsigned long)temp[0] * 65536 + (unsigned long)temp[1] * 256 + (unsigned long)temp[2];
+                const bool ok = TCA_SetChannel(i) == ExtensionResult::Ok &&
+                    HAL_I2C_Master_Transmit(&hi2c2, B02_IIC_ADDRESS, &data, 1, 1) == HAL_OK &&
+                    HAL_I2C_Master_Receive(&hi2c2, B02_IIC_ADDRESS, temp, 3, 1) == HAL_OK;
+                const unsigned long value = (unsigned long)temp[0] * 65536 + (unsigned long)temp[1] * 256 + (unsigned long)temp[2];
+                if (ok && value != 0)
+                    conversion[i+4] = value;
+                else
+                    channel_ok[i] = false;
             }
 
-						// Refer to `float PressureSensor::MS5837_30BA_GetData(int id)` to compute the four raw pressure values.
+            // Refer to `float PressureSensor::MS5837_30BA_GetData(int id)` to compute the four raw pressure values.
             // 参考float PressureSensor::MS5837_30BA_GetData(int id)计算四个原始压强
             float pressure[SENSOR_NUM] = {};
+            uint8_t frame_valid_mask = 0;
             for (int i = 0; i < SENSOR_NUM; ++i)
             {
-                if (flag_ok[i])
+                if (flag_ok[i] && channel_ok[i])
                 {
                     D2_Temp = conversion[i];
                     D1_Pres = conversion[i+4];
@@ -528,23 +595,43 @@ void PressureSensor::Handle_all()
                     OFF2 = OFF_ - OFFi;
                     SENS2 = SENS - SENSi;
                     pressure[i] = ((D1_Pres * SENS2) / 2097152.0 - OFF2) / 32768.0 / 100.0;
+                    const float pressure_diff_mbar = pressure[i] - data_pressure_offset[i];
+                    // 合理范围：MS5837-30BA 量程 0~30 bar，水面约 1000 mbar；超出视为读错
+                    if (isfinite(pressure[i]) && isfinite(pressure_diff_mbar) &&
+                        pressure[i] > 300.0f && pressure[i] < 31000.0f)
+                    {
+                        frame_valid_mask |=
+                            static_cast<uint8_t>(1U << i);
+                    }
                 }
                 // else
-                //     return -1;
+                // return -1;
             }
 
             /*
              * 只有有效压力计才更新当前压力值。
              *
-             * 无效通道保持上一帧结果，
+             * 无效通道保持上一帧结果（沿用上一次成功值），
              * 这样不会破坏原有闭环控制接口。
              */
             for (int i = 0; i < SENSOR_NUM; ++i)
             {
-                if (!flag_ok[i])
+                const uint8_t current_bit =
+                    static_cast<uint8_t>(1U << i);
+
+                /*
+                 * 初始化无效，或者本次读取不合理时，
+                 * 保留上一帧旧控制使用的数据。
+                 */
+                if (!flag_ok[i] ||
+                    (frame_valid_mask & current_bit) == 0)
                 {
+                    // 每路连续失败的第一次上报警告（传感器不参与停机）
+                    if (flag_ok[i] && ++fail_streak[i] == 1)
+                        Event_PostLimited(static_cast<uint16_t>(EV_WARN_PRESSURE_READ), i, 1000);
                     continue;
                 }
+                fail_streak[i] = 0;
 
                 data_pressure_raw[i] =
                     pressure[i];
@@ -559,6 +646,7 @@ void PressureSensor::Handle_all()
                 data_pressure[i] =
                     tmp_pres;
             }
+            pressure_valid_mask_ = frame_valid_mask;
             ++pressure_frame_id;
             ps_state = PS_HANDLE_STATE::GET_TEMPERATURE;
             break;

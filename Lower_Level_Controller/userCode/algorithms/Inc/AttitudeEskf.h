@@ -46,7 +46,8 @@ public:
 
     bool PredictGyroscope(const float gyro_body_rad_s[3],uint32_t time_us);
     bool CorrectAccelerometer(const float down_m_s2[3]);//主要修正roll,pitch;使用磁力计后可以修正yaw
-
+    bool CorrectPressure(const float depth_m[4],uint8_t valid_mask);
+    bool CorrectMagnetometer(const float mag_body_uT[3]);//使用磁力计修正yaw，一般不开
     FusionState State() const;
     bool IsInitialized() const;
     bool UpdateDepthEstimate(float depth_m);
@@ -56,6 +57,9 @@ private:
     float covariance_[6][6];//0~5 姿态误差:roll pitch yaw bias误差:bx by bz
     float gravity_m_s2_;
     float depth_m_;
+    float magnetic_reference_world_[3];
+    float magnetic_reference_uT_;
+    bool magnetic_reference_ready_;
 
     uint32_t time_us_;
     uint32_t sequence_;

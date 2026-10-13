@@ -1,0 +1,2 @@
+pyserial
+pygame        # 可选：手柄

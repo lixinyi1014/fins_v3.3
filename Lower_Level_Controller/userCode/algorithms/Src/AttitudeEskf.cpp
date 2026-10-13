@@ -131,6 +131,65 @@ namespace
 
         return true;
     }
+    /*
+ * 将磁力计测得的机体坐标向量转换到世界坐标系。
+ *
+ * 当前四元数表示：
+ * 世界坐标系向量经过旋转后得到机体坐标系向量。
+ * 因此这里使用对应的机体到世界的旋转矩阵。
+ */
+    void RotateBodyToWorld(
+        const float quaternion[4],
+        const float body[3],
+        float world[3])
+    {
+        const float w = quaternion[0];
+        const float x = quaternion[1];
+        const float y = quaternion[2];
+        const float z = quaternion[3];
+
+        const float r00 =
+            1.0f - 2.0f * (y * y + z * z);
+
+        const float r01 =
+            2.0f * (x * y - w * z);
+
+        const float r02 =
+            2.0f * (x * z + w * y);
+
+        const float r10 =
+            2.0f * (x * y + w * z);
+
+        const float r11 =
+            1.0f - 2.0f * (x * x + z * z);
+
+        const float r12 =
+            2.0f * (y * z - w * x);
+
+        const float r20 =
+            2.0f * (x * z - w * y);
+
+        const float r21 =
+            2.0f * (y * z + w * x);
+
+        const float r22 =
+            1.0f - 2.0f * (x * x + y * y);
+
+        world[0] =
+            r00 * body[0] +
+            r01 * body[1] +
+            r02 * body[2];
+
+        world[1] =
+            r10 * body[0] +
+            r11 * body[1] +
+            r12 * body[2];
+
+        world[2] =
+            r20 * body[0] +
+            r21 * body[1] +
+            r22 * body[2];
+    }
     //根据四元数，预测向下方向
     /*当前四元数认为的姿态
             ↓
@@ -453,6 +512,11 @@ void AttitudeEskf::Reset()
     covariance_[5][5] = 0.1f * 0.1f;  // 零偏 z
     gravity_m_s2_ = 0.0f;
     depth_m_ = 0.0f;
+    magnetic_reference_world_[0] = 0.0f;
+    magnetic_reference_world_[1] = 0.0f;
+    magnetic_reference_world_[2] = 0.0f;
+    magnetic_reference_uT_ = 0.0f;
+    magnetic_reference_ready_ = false;
     time_us_ = 0;
     sequence_ = 0;
     initialized_ = false;
@@ -522,7 +586,7 @@ bool AttitudeEskf::Initialize(
     );
 
     gravity_m_s2_ = gravity_m_s2;
-    depth_m_ = 0.0f;
+    //depth_m_ = 0.0f;
     time_us_ = time_us;
     initialized_ = true;
     ++sequence_;
@@ -1013,6 +1077,596 @@ bool AttitudeEskf::CorrectAccelerometer(
 
     return true;
 }
+/*
+ * 使用磁力计修正 yaw。
+ *
+ * 磁力计只提供相对航向参考：
+ *
+ * 1. 第一帧有效磁力计数据只用于保存参考方向。
+ * 2. 后续数据用于计算 yaw 误差。
+ * 3. 数据异常时只拒绝当前观测，不改变当前姿态。
+ * 4. 不因为磁力计异常停止推进器。
+ */
+bool AttitudeEskf::CorrectMagnetometer(
+    const float mag_body_uT[3])
+{
+    /*
+     * 地磁场通常在几十 uT 范围内。
+     *
+     * 这里的范围用于发现断线、未初始化
+     * 或受到强磁干扰的情况。
+     */
+    constexpr float minimum_magnitude_uT = 5.0f;
+    constexpr float maximum_magnitude_uT = 100.0f;
+
+    /*
+     * 如果磁场水平分量太小，
+     * 就无法可靠判断 yaw。
+     */
+    constexpr float minimum_horizontal_ratio = 0.1f;
+
+    /*
+     * 磁场模长变化超过这个范围时，
+     * 认为当前磁力计可能受到了外部磁干扰。
+     */
+    constexpr float magnitude_gate_uT = 25.0f;
+
+    /*
+     * 单次 yaw 观测的标准差。
+     *
+     * 磁力计容易受到电机、电源线和金属结构影响，
+     * 所以这里不能设置得过小。
+     */
+    constexpr float heading_sigma_rad =
+        10.0f * 0.01745329252f;
+
+    const float heading_variance =
+        heading_sigma_rad * heading_sigma_rad;
+
+    /*
+     * ESKF 尚未初始化时，
+     * 当前四元数还没有物理意义。
+     */
+    if (!initialized_ ||
+        mag_body_uT == nullptr ||
+        !isfinite(mag_body_uT[0]) ||
+        !isfinite(mag_body_uT[1]) ||
+        !isfinite(mag_body_uT[2]))
+    {
+        return false;
+    }
+
+    /*
+     * 计算磁场模长。
+     */
+    const float measured_magnitude_uT =
+        sqrtf(
+            mag_body_uT[0] * mag_body_uT[0] +
+            mag_body_uT[1] * mag_body_uT[1] +
+            mag_body_uT[2] * mag_body_uT[2]
+        );
+
+    /*
+     * 模长不合理时拒绝当前观测。
+     *
+     * 这里只返回 false，
+     * 不修改 ESKF，也不会让任务停止。
+     */
+    if (!isfinite(measured_magnitude_uT) ||
+        measured_magnitude_uT < minimum_magnitude_uT ||
+        measured_magnitude_uT > maximum_magnitude_uT)
+    {
+        return false;
+    }
+
+    /*
+     * 磁力计原始数据是在机体坐标系中测量的。
+     *
+     * 先根据当前姿态估计，
+     * 把它转换到世界坐标系。
+     */
+    float magnetic_world[3] = {};
+
+    RotateBodyToWorld(
+        quaternion_,
+        mag_body_uT,
+        magnetic_world
+    );
+
+    /*
+     * yaw 只能通过水平面上的磁场分量判断。
+     */
+    const float horizontal_magnitude =
+        sqrtf(
+            magnetic_world[0] * magnetic_world[0] +
+            magnetic_world[1] * magnetic_world[1]
+        );
+
+    if (!isfinite(horizontal_magnitude) ||
+        horizontal_magnitude <
+            minimum_horizontal_ratio * measured_magnitude_uT)
+    {
+        return false;
+    }
+
+    /*
+     * 后面只使用方向，
+     * 所以将磁场向量归一化。
+     */
+    if (!NormalizeVector3(magnetic_world))
+    {
+        return false;
+    }
+
+    /*
+     * 第一次有效磁力计数据只建立相对参考。
+     *
+     * 这里不修改 quaternion_，
+     * 所以不会因为上电时船头朝向不同而突然转动。
+     */
+    if (!magnetic_reference_ready_)
+    {
+        magnetic_reference_world_[0] =
+            magnetic_world[0];
+
+        magnetic_reference_world_[1] =
+            magnetic_world[1];
+
+        magnetic_reference_world_[2] =
+            magnetic_world[2];
+
+        magnetic_reference_uT_ =
+            measured_magnitude_uT;
+
+        magnetic_reference_ready_ = true;
+
+        return true;
+    }
+
+    /*
+     * 检查当前磁场模长是否与启动时接近。
+     *
+     * 金属物体、电机电流和电源线可能改变磁场模长。
+     */
+    if (fabsf(
+            measured_magnitude_uT -
+            magnetic_reference_uT_
+        ) > magnitude_gate_uT)
+    {
+        return false;
+    }
+
+    /*
+     * 计算启动参考方向和当前方向的水平航向角。
+     */
+    const float reference_heading_rad =
+        atan2f(
+            magnetic_reference_world_[1],
+            magnetic_reference_world_[0]
+        );
+
+    const float current_heading_rad =
+        atan2f(
+            magnetic_world[1],
+            magnetic_world[0]
+        );
+
+    /*
+     * 计算“参考方向 - 当前方向”。
+     *
+     * 这个方向的符号很重要：
+     *
+     * 当前 yaw 如果向正方向漂移，
+     * current_heading 会变大，
+     * residual 就会变成负值，
+     * ESKF 会向反方向修正。
+     */
+    const float raw_residual_rad =
+        reference_heading_rad -
+        current_heading_rad;
+
+    /*
+     * 将角度误差限制到 [-pi, pi]。
+     */
+    const float residual_rad =
+        atan2f(
+            sinf(raw_residual_rad),
+            cosf(raw_residual_rad)
+        );
+
+    /*
+     * 一次观测不允许产生过大的 yaw 跳变。
+     *
+     * 这只是拒绝异常观测，
+     * 不会停止控制任务。
+     */
+    if (!isfinite(residual_rad) ||
+        fabsf(residual_rad) > 0.8f)
+    {
+        return false;
+    }
+
+    /*
+     * 磁力计这一帧只观测 yaw。
+     *
+     * 状态顺序是：
+     *
+     * error[0]：roll
+     * error[1]：pitch
+     * error[2]：yaw
+     * error[3]：gyro bias x
+     * error[4]：gyro bias y
+     * error[5]：gyro bias z
+     */
+    float h[6] = {};
+    h[2] = 1.0f;
+
+    /*
+     * ph = P * H^T。
+     *
+     * 因为 h 只有 yaw 位置为 1，
+     * 所以 ph 实际上就是 covariance_ 的第 3 列。
+     */
+    float ph[6] = {};
+
+    for (unsigned i = 0; i < 6; ++i)
+    {
+        for (unsigned j = 0; j < 6; ++j)
+        {
+            ph[i] +=
+                covariance_[i][j] * h[j];
+        }
+    }
+
+    /*
+     * S = H * P * H^T + R。
+     *
+     * S 是当前 yaw 误差预测方差
+     * 加上磁力计测量噪声方差。
+     */
+    const float innovation_variance =
+        ph[2] + heading_variance;
+
+    if (!isfinite(innovation_variance) ||
+        innovation_variance <= 1.0e-6f)
+    {
+        return false;
+    }
+
+    /*
+     * K = P * H^T * S^-1。
+     */
+    float gain[6] = {};
+
+    for (unsigned i = 0; i < 6; ++i)
+    {
+        gain[i] =
+            ph[i] /
+            innovation_variance;
+    }
+
+    /*
+     * error = K * residual。
+     *
+     * 这是本次需要注入名义状态的误差。
+     */
+    float error[6] = {};
+
+    for (unsigned i = 0; i < 6; ++i)
+    {
+        error[i] =
+            gain[i] * residual_rad;
+    }
+
+    const float error_angle =
+        sqrtf(
+            error[0] * error[0] +
+            error[1] * error[1] +
+            error[2] * error[2]
+        );
+
+    /*
+     * 单帧姿态修正不能过大。
+     */
+    if (!isfinite(error_angle) ||
+        error_angle > 0.5f)
+    {
+        return false;
+    }
+
+    /*
+     * A = I - K * H。
+     */
+    float a[6][6] = {};
+
+    for (unsigned i = 0; i < 6; ++i)
+    {
+        for (unsigned j = 0; j < 6; ++j)
+        {
+            a[i][j] =
+                (i == j) ? 1.0f : 0.0f;
+
+            a[i][j] -=
+                gain[i] * h[j];
+        }
+    }
+
+    /*
+     * 使用 Joseph 形式更新协方差：
+     *
+     * P = A P A^T + K R K^T
+     */
+    float ap[6][6] = {};
+    float next_covariance[6][6] = {};
+
+    for (unsigned i = 0; i < 6; ++i)
+    {
+        for (unsigned j = 0; j < 6; ++j)
+        {
+            for (unsigned k = 0; k < 6; ++k)
+            {
+                ap[i][j] +=
+                    a[i][k] * covariance_[k][j];
+            }
+        }
+    }
+
+    for (unsigned i = 0; i < 6; ++i)
+    {
+        for (unsigned j = 0; j < 6; ++j)
+        {
+            for (unsigned k = 0; k < 6; ++k)
+            {
+                next_covariance[i][j] +=
+                    ap[i][k] * a[j][k];
+            }
+
+            next_covariance[i][j] +=
+                gain[i] *
+                heading_variance *
+                gain[j];
+        }
+    }
+
+    /*
+     * 姿态误差注入后，
+     * 将误差协方差转换回新的局部误差坐标。
+     */
+    float error_skew[3][3] = {};
+
+    BuildSkewMatrix(
+        error,
+        error_skew
+    );
+
+    float reset_matrix[6][6] = {};
+
+    for (unsigned i = 0; i < 6; ++i)
+    {
+        reset_matrix[i][i] = 1.0f;
+    }
+
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        for (unsigned j = 0; j < 3; ++j)
+        {
+            reset_matrix[i][j] -=
+                0.5f * error_skew[i][j];
+        }
+    }
+
+    float reset_left[6][6] = {};
+    float corrected_covariance[6][6] = {};
+
+    for (unsigned i = 0; i < 6; ++i)
+    {
+        for (unsigned j = 0; j < 6; ++j)
+        {
+            for (unsigned k = 0; k < 6; ++k)
+            {
+                reset_left[i][j] +=
+                    reset_matrix[i][k] *
+                    next_covariance[k][j];
+            }
+        }
+    }
+
+    for (unsigned i = 0; i < 6; ++i)
+    {
+        for (unsigned j = 0; j < 6; ++j)
+        {
+            for (unsigned k = 0; k < 6; ++k)
+            {
+                corrected_covariance[i][j] +=
+                    reset_left[i][k] *
+                    reset_matrix[j][k];
+            }
+        }
+    }
+
+    /*
+     * 将三个姿态误差转换为误差四元数。
+     */
+    float correction_quaternion[4] = {};
+    float corrected_quaternion[4] = {};
+
+    if (!RotationVectorToQuaternion(
+            error,
+            correction_quaternion))
+    {
+        return false;
+    }
+
+    /*
+     * 将小误差注入当前名义四元数。
+     */
+    MultiplyQuaternion(
+        quaternion_,
+        correction_quaternion,
+        corrected_quaternion
+    );
+
+    const float quaternion_norm =
+        sqrtf(
+            corrected_quaternion[0] *
+                corrected_quaternion[0] +
+            corrected_quaternion[1] *
+                corrected_quaternion[1] +
+            corrected_quaternion[2] *
+                corrected_quaternion[2] +
+            corrected_quaternion[3] *
+                corrected_quaternion[3]
+        );
+
+    if (!isfinite(quaternion_norm) ||
+        quaternion_norm <= 1.0e-6f)
+    {
+        return false;
+    }
+
+    for (unsigned i = 0; i < 4; ++i)
+    {
+        corrected_quaternion[i] /=
+            quaternion_norm;
+    }
+
+    /*
+     * 检查协方差是否仍然有效。
+     */
+    for (unsigned i = 0; i < 6; ++i)
+    {
+        if (!isfinite(corrected_covariance[i][i]) ||
+            corrected_covariance[i][i] <= 0.0f)
+        {
+            return false;
+        }
+
+        /*
+         * 强制恢复协方差矩阵对称性。
+         */
+        for (unsigned j = i + 1; j < 6; ++j)
+        {
+            const float average =
+                0.5f *
+                (
+                    corrected_covariance[i][j] +
+                    corrected_covariance[j][i]
+                );
+
+            corrected_covariance[i][j] =
+                average;
+
+            corrected_covariance[j][i] =
+                average;
+        }
+    }
+
+    /*
+     * 所有计算成功后，
+     * 最后一次性写回 ESKF 内部状态。
+     */
+    memcpy(
+        quaternion_,
+        corrected_quaternion,
+        sizeof(quaternion_)
+    );
+
+    memcpy(
+        covariance_,
+        corrected_covariance,
+        sizeof(covariance_)
+    );
+
+    /*
+     * 磁力计主要修正 yaw，
+     * 但如果协方差中存在交叉相关，
+     * 也可能间接修正陀螺仪零偏。
+     */
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        gyro_bias_[i] +=
+            error[i + 3];
+    }
+
+    ++sequence_;
+
+    return true;
+}
+bool AttitudeEskf::CorrectPressure(const float depth_m[4],uint8_t valid_mask) {
+    constexpr uint8_t all_pressure_mask = 0x0FU;
+
+    if (!initialized_ || depth_m == nullptr || (valid_mask & all_pressure_mask) != all_pressure_mask)
+    {
+        return false;
+    }
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        if (!isfinite(depth_m[i]))
+        {
+            return false;
+        }
+    }
+    /*
+     * 空气中四路之间没有水柱差，读数相同会被误当成"水平"，
+     * 把台架上的真实倾角往 0 拉。所有通道至少 5 cm 水深才用压差修正姿态。
+     */
+    constexpr float minimum_attitude_depth_m = 0.05f;
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        if (depth_m[i] < minimum_attitude_depth_m)
+        {
+            return false;
+        }
+    }
+    /*
+     * 水压计相对舱体位置（V3.3 设计图 p7 / 外形.STEP，与 fins_v3 FusionConfiguration 一致）：
+     *   0 左前 (+x,-y)   1 左后 (-x,-y)   2 右后 (-x,+y)   3 右前 (+x,+y)
+     * 机体系 FRD：x 前、y 右、z 下。
+     * 深度 d_i = d0 - x_i*sin(pitch) + y_i*cos(pitch)*sin(roll)，
+     * 预测的"向下"方向 down = (-sin(pitch), cos(pitch)sin(roll), cos(pitch)cos(roll))。
+     */
+    constexpr float sensor_half_x_m = 0.1247f;
+    constexpr float sensor_half_y_m = 0.0691f;
+
+    // 前(0,3) 减 后(1,2)：抬头时前面变浅，结果为 -4*hx*sin(pitch)，正好等于 4*hx*down_x
+    // （原来写成 后减前，俯仰修正方向反了）
+    const float down_x =
+    (depth_m[0] +
+     depth_m[3] -
+     depth_m[1] -
+     depth_m[2]) /
+    (4.0f * sensor_half_x_m);
+
+    // 右(2,3) 减 左(0,1)：右倾时右边变深
+    const float down_y =
+    (depth_m[2] +
+     depth_m[3] -
+     depth_m[0] -
+     depth_m[1]) /
+    (4.0f * sensor_half_y_m);
+
+    const float down_z_square =
+    1.0f -
+    down_x * down_x -
+    down_y * down_y;
+
+    if (!(down_z_square > 0.0f))
+    {
+        return false; // 压差对应的倾角超出物理范围（噪声或波浪），本次不修正
+    }
+
+    const float down_z =
+    sqrtf(down_z_square);
+    //恢复单位
+    const float pressure_down_m_s2[3] =
+    {
+        gravity_m_s2_ * down_x,
+        gravity_m_s2_ * down_y,
+        gravity_m_s2_ * down_z
+    };
+
+    return CorrectAccelerometer(pressure_down_m_s2);
+}
 FusionState AttitudeEskf::State() const
 {
     FusionState state = {};
@@ -1066,4 +1720,4 @@ bool AttitudeEskf::UpdateDepthEstimate(
     ++sequence_;
 
     return true;
-}
+}

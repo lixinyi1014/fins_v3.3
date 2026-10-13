@@ -5,6 +5,10 @@
 #include "ControllerTask.h"
 #include "Sensor.h"
 #include "IMU.h"
+#include "EventLog.h"
+
+#include <string.h>
+#include <stdlib.h>
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -47,6 +51,114 @@ namespace
     StackType_t idle_task_stack[configMINIMAL_STACK_SIZE];
 
     /*
+     * 串口命令缓冲：单生产者（USART6 中断）/ 单消费者（本任务）环形队列。
+     * 不调用任何 FreeRTOS API，所以 USART6 中断优先级保持原来的 4 也没问题。
+     */
+    constexpr uint32_t kCommandSlots = 8;
+    struct CommandPacket
+    {
+        uint16_t length;
+        char data[SERIAL_LENGTH_MAX];
+    };
+    CommandPacket command_slots[kCommandSlots];
+    volatile uint32_t command_write = 0; // 只由中断修改
+    volatile uint32_t command_read = 0;  // 只由本任务修改
+    volatile uint32_t silent_cycles = 0;
+
+    // 已知命令前缀，只用于识别"未知命令"并上报警告，不影响各设备自己的解析
+    const char *const kKnownCommands[] = {
+        "ON", "OFF", "UP", "DN", "W", "A", "S", "D", "Q", "E", "Z",
+        "H:", "RPY:", "ACL:", "ANG:", "TES:", "MOT:", "CA", "VA",
+        "BEG", "END", "IVA:", "HB", "EVQ:"};
+
+    bool IsKnownCommand(const char *line, size_t length)
+    {
+        for (const char *known : kKnownCommands)
+        {
+            const size_t n = strlen(known);
+            if (n == 1)
+            {
+                if (length == 1 && line[0] == known[0])
+                    return true;
+            }
+            else if (length >= n && strncmp(line, known, n) == 0)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /*
+     * 处理一行命令：每个设备都拿到一份完整、以 0 结尾的原始命令
+     * （舵机等模块会用 strtok 改写缓冲，所以每个设备之前都重新复制）。
+     */
+    void DispatchLine(const char *line, size_t length)
+    {
+        if (length == 0)
+            return;
+        if (length >= SERIAL_LENGTH_MAX)
+            length = SERIAL_LENGTH_MAX - 1;
+        if (length == 2 && line[0] == 'H' && line[1] == 'B')
+            return; // 心跳：只刷新存活时间
+        if (length > 4 && strncmp(line, "EVQ:", 4) == 0)
+        {
+            char number[16] = {};
+            memcpy(number, line + 4, length - 4 < sizeof(number) - 1 ? length - 4 : sizeof(number) - 1);
+            Telemetry_RequestResend(strtoul(number, nullptr, 10));
+            return;
+        }
+        if (!IsKnownCommand(line, length))
+        {
+            // 未知命令只上报，照常分发（设备自己会忽略）
+            // 事件里只存指针，所以轮流使用 8 个静态缓冲，补发时文字不会被后来的命令覆盖
+            static char unknown_text[8][12];
+            static uint32_t unknown_index = 0;
+            char *text = unknown_text[unknown_index++ % 8];
+            const size_t n = length < 11 ? length : 11;
+            memcpy(text, line, n);
+            text[n] = '\0';
+            Event_PostText(EV_WARN_UNKNOWN_CMD, static_cast<int32_t>(length), text);
+        }
+        for (uint32_t i = 0; i < device_count; ++i)
+        {
+            memset(RxBuffer, 0, SERIAL_LENGTH_MAX);
+            memcpy(RxBuffer, line, length);
+            device_list[i]->Receive();
+        }
+        memset(RxBuffer, 0, SERIAL_LENGTH_MAX);
+    }
+
+    /*
+     * 取出本周期收到的所有数据包，按 \r \n ; 拆成多条命令。
+     * 旧上位机发命令不带换行，整包就是一条命令，同样兼容。
+     * 返回本周期是否收到过数据（用于心跳）。
+     */
+    bool DispatchReceivedCommands()
+    {
+        bool received = false;
+        while (command_read != command_write)
+        {
+            const CommandPacket &packet = command_slots[command_read % kCommandSlots];
+            received = true;
+            size_t start = 0;
+            for (size_t i = 0; i <= packet.length; ++i)
+            {
+                const bool end = i == packet.length;
+                const char c = end ? '\n' : packet.data[i];
+                if (c == '\r' || c == '\n' || c == ';' || c == '\0')
+                {
+                    DispatchLine(packet.data + start, i - start);
+                    start = i + 1;
+                }
+            }
+            __DMB();
+            command_read = command_read + 1;
+        }
+        return received;
+    }
+
+    /*
      * 这就是实际运行的任务函数。
      * FreeRTOS 任务函数必须是：
      * void 函数，接收一个 void* 参数。
@@ -79,6 +191,15 @@ namespace
              *   阻塞时不占用 CPU。
              */
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+            /*
+             * 先处理上一周期内收到的命令，再执行设备 Handle()。
+             * 收到任何数据都算一次心跳。
+             */
+            if (DispatchReceivedCommands())
+                silent_cycles = 0;
+            else if (silent_cycles < 0xFFFFFFFFU)
+                silent_cycles = silent_cycles + 1;
 
             /*
              * 这部分就是原来 Usermain.cpp 中
@@ -145,8 +266,41 @@ namespace
                     }
                 }
             }
+            /*
+             * 发送事件和状态行（只写入发送缓冲，不会阻塞）。
+             */
+            Telemetry_Step();
         }
     }
+}
+
+bool CommandQueue_PushFromISR(const uint8_t *data, uint16_t length)
+{
+    if (command_write - command_read >= kCommandSlots)
+        return false; // 满了，丢弃这一包
+    CommandPacket &packet = command_slots[command_write % kCommandSlots];
+    if (length > SERIAL_LENGTH_MAX - 1)
+        length = SERIAL_LENGTH_MAX - 1;
+    memcpy(packet.data, data, length);
+    packet.data[length] = '\0';
+    packet.length = length;
+    __DMB();
+    command_write = command_write + 1;
+    return true;
+}
+
+uint32_t CommandSilentCycles(void)
+{
+    return silent_cycles;
+}
+
+/*
+ * 任务栈溢出（configCHECK_FOR_STACK_OVERFLOW = 2 时由内核调用）。
+ */
+extern "C" void vApplicationStackOverflowHook(TaskHandle_t task, char *task_name)
+{
+    (void)task;
+    Fins_Fatal(EV_FATAL_STACK_OVERFLOW, 0, task_name);
 }
 /*
  * FreeRTOS 启动调度器时会调用这个函数，
@@ -307,4 +461,4 @@ bool WaitImuSample(ImuSample *sample, uint32_t timeout_ms)
         sample,
         wait_ticks
     ) == pdPASS;
-}
+}

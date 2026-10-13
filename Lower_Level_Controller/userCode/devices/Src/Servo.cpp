@@ -2,6 +2,7 @@
 // Created by admin on 2023/12/5.
 //
 #include "Servo.h"
+#include "EventLog.h"
 
 int32_t ID_V30[4] = {8, 9, 10, 11}; // Channel indices on the PWM expansion board for the four servos: upper-left, lower-left, upper-right, lower-right. // 4个舵机接在PWM扩展板的编号，左上-左下-右上-右下
 int32_t ID_V31[4] = {8, 9, 10, 11};
@@ -19,7 +20,7 @@ void Servo::Init()
     __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_2, data[0]);
     __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_3, data[2]);
     __HAL_TIM_SetCompare(&htim1, TIM_CHANNEL_4, data[1]);
-    HAL_UARTEx_ReceiveToIdle_IT(&huart6, RxBuffer, SERIAL_LENGTH_MAX);
+    // 串口接收统一在 main() 里开启（使用独立的中断接收缓冲）
 }
 
 void Servo_I2C::Init()
@@ -52,7 +53,7 @@ void Servo_I2C::Init()
         //------TODO：i+8为舵机在扩展板上的接口编号，根据接线修改，目前为8-11号
         PCA_Setpwm(i + 8, 0, floor(data[i] * 4096 / 20000 + 0.5f));
     }
-    HAL_UARTEx_ReceiveToIdle_IT(&huart6, RxBuffer, SERIAL_LENGTH_MAX);
+    // 串口接收统一在 main() 里开启（使用独立的中断接收缓冲）
 }
 
 void Servo::Receive()
@@ -90,7 +91,8 @@ void Servo_I2C::Handle()
     {
         for (int i = 0; i < SERVO_NUM; ++i)
         {
-            PCA_Setpwm(ID[i], 0, floor(data[i] * 4096 / 20000 + 0.5f));
+            if (PCA_Setpwm(ID[i], 0, floor(data[i] * 4096 / 20000 + 0.5f)) != ExtensionResult::Ok)
+                Event_PostLimited(EV_WARN_SERVO_WRITE, i, 1000); // 舵机写失败只警告，不停机
         }
     }
 

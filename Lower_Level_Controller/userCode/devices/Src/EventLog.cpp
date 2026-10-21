@@ -38,6 +38,7 @@ uint8_t g_tx[kTxSize];
 volatile uint32_t g_tx_head = 0;     // 写入计数（单调递增）
 volatile uint32_t g_tx_tail = 0;     // 已发送计数（单调递增）
 volatile uint32_t g_tx_inflight = 0; // 当前 HAL 中断发送中的字节数，0 表示空闲
+volatile uint32_t g_tx_start_ms = 0;  // 这一段开始发送的时间，用于发现发送卡住
 volatile uint32_t g_tx_dropped = 0;
 
 uint32_t g_next_send = 1;            // 下一条要发的事件序号（只在控制任务里用）
@@ -45,6 +46,7 @@ volatile uint32_t g_resend_from = 0; // 上位机补发请求，0 表示没有
 uint32_t g_cycle = 0;
 TelemetryStatusFn g_status_fn = nullptr;
 TelemetryStatusFn g_plot_fn = nullptr;
+TelemetryStatusFn g_pid_fn = nullptr;
 FatalNeutralFn g_fatal_neutral = nullptr;
 
 // PRIMASK 临界区：任务、任意优先级中断、调度器启动前都可用，持续时间只有几十个指令。
@@ -73,6 +75,18 @@ uint32_t OldestSeq(uint32_t last)
     return last >= kLogSize ? last - kLogSize + 1 : 1;
 }
 
+/*
+ * 上报"事件已被覆盖"(211) 并返回此刻仍保留的最早序号。
+ * 注意顺序：211 本身也要占一格，会把环形缓冲里最旧的那条挤掉，所以必须先记 211、再算最早序号。
+ * 原来是先算再记，算出来的那一条马上被 211 覆盖，发送循环发现对不上又记一条 211……
+ * 一直空转、一条事件也发不出去（上位机在下位机运行很久后才连上时必然出现）。
+ */
+uint32_t PostLostAndGetOldest()
+{
+    Event_Post(EV_WARN_EVENT_LOST, static_cast<int32_t>(OldestSeq(g_last_seq + 1)));
+    return OldestSeq(g_last_seq);
+}
+
 // ---------- 发送 ----------
 void StartTxLocked()
 {
@@ -83,7 +97,10 @@ void StartTxLocked()
     if (len > kTxSize - start)
         len = kTxSize - start; // 到缓冲尾部为止，剩余部分下一次发
     if (HAL_UART_Transmit_IT(&huart6, &g_tx[start], static_cast<uint16_t>(len)) == HAL_OK)
+    {
         g_tx_inflight = len;
+        g_tx_start_ms = HAL_GetTick();
+    }
 }
 
 uint32_t TxFree()
@@ -272,6 +289,11 @@ void Telemetry_SetPlotSource(TelemetryStatusFn fn)
     g_plot_fn = fn;
 }
 
+void Telemetry_SetPidSource(TelemetryStatusFn fn)
+{
+    g_pid_fn = fn;
+}
+
 void Fins_SetFatalNeutral(FatalNeutralFn fn)
 {
     g_fatal_neutral = fn;
@@ -299,20 +321,16 @@ void Telemetry_Write(const char *data, uint16_t len)
 void Telemetry_Step(void)
 {
     ++g_cycle;
-    char line[160];
+    char line[256];   // $PL 加了水压计、加计 7 个字段，160 在极端值时会截断
 
     // 1. 补发请求
     const uint32_t request = g_resend_from;
     if (request)
     {
         g_resend_from = 0;
-        const uint32_t oldest = OldestSeq(g_last_seq);
         uint32_t from = request;
-        if (from < oldest)
-        {
-            Event_Post(EV_WARN_EVENT_LOST, static_cast<int32_t>(oldest));
-            from = oldest;
-        }
+        if (from < OldestSeq(g_last_seq))
+            from = PostLostAndGetOldest();
         if (from < g_next_send)
             g_next_send = from;
     }
@@ -325,14 +343,11 @@ void Telemetry_Step(void)
         Record r;
         const uint32_t primask = Lock();
         r = g_log[g_next_send % kLogSize];
-        const uint32_t last = g_last_seq;
         Unlock(primask);
         if (r.seq != g_next_send)
         {
             // 已被新事件覆盖（落后超过 128 条）
-            const uint32_t oldest = OldestSeq(last);
-            Event_Post(EV_WARN_EVENT_LOST, static_cast<int32_t>(oldest));
-            g_next_send = oldest;
+            g_next_send = PostLostAndGetOldest();
             continue;
         }
         const int len = FormatEvent(line, sizeof(line), r);
@@ -366,16 +381,19 @@ void Telemetry_Step(void)
             WriteBytes(line, static_cast<uint32_t>(len));
     }
 
-    // 4. 曲线行（优先级最低：缓冲紧张时先不发）
-    if (g_plot_fn && g_cycle % kPlotEveryCycles == 0 && TxFree() > 3 * sizeof(line))
+    // 4. 曲线行 $PL 和 PID 分解行 $PD（优先级最低：缓冲紧张时先不发）。两种行错开 2 个周期发，串口负载更均匀
+    const bool plot_turn = g_cycle % kPlotEveryCycles == 0;
+    const bool pid_turn = g_cycle % kPlotEveryCycles == 2;
+    TelemetryStatusFn fn = plot_turn ? g_plot_fn : (pid_turn ? g_pid_fn : nullptr);
+    if (fn && TxFree() > 3 * sizeof(line))
     {
         int len = 0;
-        memcpy(line, "$PL,", 4);
+        memcpy(line, plot_turn ? "$PL," : "$PD,", 4);
         len = 4;
         len = AppendUint(line, len, HAL_GetTick());
         line[len++] = ',';
         const int avail = static_cast<int>(sizeof(line)) - len - 8;
-        const int n = g_plot_fn(line + len, avail);
+        const int n = fn(line + len, avail);
         if (n > 0 && n < avail)
         {
             len += n;
@@ -385,7 +403,24 @@ void Telemetry_Step(void)
         }
     }
 
-    // 5. 发送缓冲溢出
+    // 5. 发送卡住：一段最多 2048 字节，115200 下约 0.2 s 发完；超过 0.5 s 没有发送完成中断就强制重启
+    {
+        uint32_t stalled = 0;
+        const uint32_t primask = Lock();
+        if (g_tx_inflight != 0 && HAL_GetTick() - g_tx_start_ms > 500U)
+        {
+            HAL_UART_AbortTransmit(&huart6);
+            stalled = g_tx_inflight;
+            g_tx_tail += g_tx_inflight; // 这一段丢掉，事件可由上位机按序号补发
+            g_tx_inflight = 0;
+            StartTxLocked();
+        }
+        Unlock(primask);
+        if (stalled)
+            Event_PostLimited(EV_WARN_UART_TX_STALL, static_cast<int32_t>(stalled), 1000);
+    }
+
+    // 6. 发送缓冲溢出
     uint32_t dropped;
     {
         const uint32_t primask = Lock();

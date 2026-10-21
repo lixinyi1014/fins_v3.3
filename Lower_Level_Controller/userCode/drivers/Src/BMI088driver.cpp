@@ -3,7 +3,7 @@
 #include "BMI088Middleware.h"
 
 
-float BMI088_ACCEL_SEN = BMI088_ACCEL_3G_SEN; // 与 bmi088_accel_init() 写入的 BMI088_ACC_RANGE_3G 一致（原来误用 6G 灵敏度，读数大一倍）
+float BMI088_ACCEL_SEN = BMI088_ACCEL_6G_SEN; // 上电复位默认 ±6g；初始化后由 BMI088_accel_sync_sensitivity() 按实际量程寄存器改写
 float BMI088_GYRO_SEN = BMI088_GYRO_2000_SEN;
 
 
@@ -93,14 +93,12 @@ uint8_t BMI088_init(void)
     BMI088_com_init();
 
     // self test pass and init
+    // 自检没过也照样配置加计（原来直接跳过配置，加计停在复位默认的 ±6g、100 Hz）
     if (bmi088_accel_self_test() != BMI088_NO_ERROR)
     {
         error |= BMI088_SELF_TEST_ACCEL_ERROR;
     }
-    else
-    {
-        error |= bmi088_accel_init();
-    }
+    error |= bmi088_accel_init();
 
     if (bmi088_gyro_self_test() != BMI088_NO_ERROR)
     {
@@ -112,6 +110,27 @@ uint8_t BMI088_init(void)
     }
 
     return error;
+}
+
+/*
+ * 读加计实际量程寄存器，设置对应的灵敏度。不管上面的自检、配置是否成功，读数单位都正确。
+ * 返回量程码 0..3（±3/6/12/24g），读不到有效值返回 0xFF 并保持原灵敏度。
+ */
+uint8_t BMI088_accel_sync_sensitivity(void)
+{
+    static const float kSensitivity[4] = {BMI088_ACCEL_3G_SEN, BMI088_ACCEL_6G_SEN, BMI088_ACCEL_12G_SEN, BMI088_ACCEL_24G_SEN};
+    volatile uint8_t range = 0xFF;
+    // 读两次：复位后的第一次 SPI 访问只用来把接口切到 SPI 模式
+    BMI088_accel_read_single_reg(BMI088_ACC_RANGE, range);
+    BMI088_delay_us(BMI088_COM_WAIT_SENSOR_TIME);
+    BMI088_accel_read_single_reg(BMI088_ACC_RANGE, range);
+    BMI088_delay_us(BMI088_COM_WAIT_SENSOR_TIME);
+    if (range > BMI088_ACC_RANGE_24G)
+    {
+        return 0xFF;
+    }
+    BMI088_ACCEL_SEN = kSensitivity[range];
+    return range;
 }
 
 uint8_t bmi088_accel_init(void)

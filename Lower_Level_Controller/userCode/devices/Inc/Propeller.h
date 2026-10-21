@@ -133,6 +133,13 @@ private:
     uint32_t tca_fail_streak_ = 0;
     uint16_t stop_code_ = 0;        // 最近一次停机原因（EventLog.h 1xx），重新 ON/TES 后清零
     bool yaw_from_fusion_ = false;  // 偏航闭环的目标和反馈来自 ESKF（true）还是旧 IMU（false），二者不混用
+    /* 姿态/深度闭环反馈来源：false=四路水压差（与原版仓库相同，默认），true=ESKF。运行时用 FB:PRS / FB:ESKF 切换 */
+    bool feedback_fusion_ = false;
+    /* 积分暂停（2026-10-20，见 Propeller.cpp kIntegralHoldAfter_ms） */
+    float last_target_depth_ = 0.0f;
+    uint32_t target_change_ms_ = 0;
+    uint32_t motion_active_ms_ = 0;
+    bool motion_seen_ = false;
     void TrackFailure(bool ok, uint32_t &streak, uint16_t warn_code, uint16_t stop_code, int32_t arg);
     void ResetVerticalControl();
     void ResetHorizontalControl();
@@ -157,6 +164,8 @@ public:
     int FormatStatusFields(char *buf, int size);
     /* 曲线字段，供 EventLog 的 $PL 使用（姿态、角速度及其目标、深度、各通道控制量）。 */
     int FormatPlotFields(char *buf, int size);
+    /* PID 分解字段，供 EventLog 的 $PD 使用：深度 P/I/D，横滚、俯仰外环 P/I/D 和内环角速度阻尼项，全部换算成控制量 us。 */
+    int FormatPidFields(char *buf, int size);
     /* 致命错误时由 EventLog 调用：尽力把 8 路推进器写回中位。 */
     void FatalNeutral();
 };

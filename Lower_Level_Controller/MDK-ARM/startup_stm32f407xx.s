@@ -235,6 +235,7 @@ SysTick_Handler PROC
                 B       .
                 ENDP
 
+                IMPORT  Fins_UnhandledIrq          ; unhandled IRQ: report event 905 (see EventLog.h) and halt
 Default_Handler PROC
 
                 EXPORT  WWDG_IRQHandler                   [WEAK]                                        
@@ -401,7 +402,7 @@ DCMI_IRQHandler
 HASH_RNG_IRQHandler
 FPU_IRQHandler  
            
-                B       .
+                B       Fins_UnhandledIrq
 
                 ENDP
 

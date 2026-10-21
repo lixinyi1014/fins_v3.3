@@ -24,6 +24,7 @@ struct PID_Regulator_t {
     float componentKdMax;
     float output;
     float outputMax;
+    bool integralHold = false; // true 时本次不积分（积分项保持原值），由调用方按工况设置
     PID_Regulator_t(){};
     PID_Regulator_t(float kp, float ki, float kd, float pM, float iM, float dM, float oM):
         kp(kp), ki(ki), kd(kd), componentKpMax(pM), componentKiMax(iM), componentKdMax(dM), outputMax(oM){};

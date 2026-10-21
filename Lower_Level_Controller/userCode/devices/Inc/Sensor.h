@@ -154,6 +154,36 @@ public:
     uint32_t GetPressureFrameID() const {return pressure_frame_id;};
     uint8_t ValidMask() const {return pressure_valid_mask_;}
     bool CopyLatestSample(PressureSample *sample) const;
+
+    /*
+     * 水下偏置（2026-10-20）：四路水压计安装高度差等造成的固定压差。
+     * 只在水下扣除（深度 2~5 mbar 之间渐入），四路之和为 0，不影响深度，只影响水压差算出的横滚/俯仰。
+     * LVL：车在水下静止（推进器不转）时，以加速度计姿态为准测 5 s，算出新偏置并存 Flash；
+     * LVL:DEF：恢复程序默认值（2026-10-20 沉底数据测得）。
+     */
+    void LevelCalStart();
+    void LevelResetDefault();
+    bool LevelCalBusy() const { return level_cal_active_; }
+    // 推进器是否在转（Usermain 里设置）：在转时不标定、不写 Flash（擦 Flash 会让单片机停 1~2 s）
+    void SetLevelGuard(bool (*thrusters_active)()) { level_guard_ = thrusters_active; }
+    void LevelCalFail(int32_t reason, const char *text);
+    float level_offset_mbar[SENSOR_NUM] = {};
+
+private:
+    void LevelLoad();
+    bool LevelSave(bool from_calibration);
+    void LevelCalStep();
+    bool LevelBlocked() const { return level_guard_ != nullptr && level_guard_(); }
+    bool (*level_guard_)() = nullptr;
+    float pressure_no_level_[SENSOR_NUM] = {}; // 只扣了空气零点、没扣水下偏置的读数（标定用）
+    float level_weight_ = 0.0f;                // 0 空气中 ~ 1 水下
+    bool level_cal_active_ = false;
+    uint32_t level_cal_start_ms_ = 0;
+    uint32_t level_cal_frames_ = 0;
+    uint32_t level_cal_bad_frames_ = 0;
+    uint32_t level_cal_last_frame_ = 0;
+    double level_sum_p_[SENSOR_NUM] = {};
+    double level_sum_down_[3] = {};
 };
 
 class Sonar: public Device{

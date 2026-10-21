@@ -18,8 +18,6 @@ void IMU::Init()
 {
     // 初始化失败：保持原来"继续运行"的行为，但上报各自的编号
     const uint8_t bmi088_error = BMI088_init();
-    if (bmi088_error != BMI088_NO_ERROR)
-        Event_Post(EV_WARN_BMI088_INIT, bmi088_error);
 #ifdef IMU_USE_MAG
     const uint8_t ist8310_error = ist8310_init();
     if (ist8310_error != IST8310_NO_ERROR)
@@ -39,6 +37,14 @@ void IMU::Init()
     HAL_Delay(1);    // Delay for 1 ms. //延时1ms
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);    // Set PA4 to high to deassert the accelerometer chip select. // PA4置1，取消片选加速度计
 
+    // 按加计实际量程设灵敏度（自检/配置失败时加计停在默认 ±6g，原来固定按 3g 换算会让读数只有一半，ESKF 永远不就绪）
+    const uint8_t accel_range = BMI088_accel_sync_sensitivity();
+    if (bmi088_error != BMI088_NO_ERROR)
+    {
+        static const char *const kRangeText[4] = {"3g", "6g", "12g", "24g"};
+        Event_PostText(EV_WARN_BMI088_INIT, bmi088_error, accel_range < 4 ? kRangeText[accel_range] : "?");
+    }
+
 
     PID_Regulator_t _tempPID(1500, 0.08, 0, MPU6500_TEMP_PWM_MAX, MPU6500_TEMP_PWM_MAX, 0, MPU6500_TEMP_PWM_MAX);
 
@@ -51,12 +57,14 @@ void IMU::Init()
     pro_data.ins_angle[0] = 0.0f;
     pro_data.ins_angle[1] = 0.0f;
     pro_data.ins_angle[2] = 0.0f;
-    raw_data.gyro_offset[0] = 0.0f;
-    raw_data.gyro_offset[1] = 0.0f;
-    raw_data.gyro_offset[2] = 0.0f;
-    // 原值 0.07 / -0.17 是在误用 6G 灵敏度（读数×2）时整定的，换成正确的 3G 灵敏度后减半
-    raw_data.accel_offset[0] = 0.035f;
-    raw_data.accel_offset[1] = -0.085f;
+    // 陀螺零偏（2026-10-20 沉底静止 14 分钟测得，IMU 原始轴，rad/s；IMU 有恒温加热，零偏稳定）
+    // 遥测里看到的是 FRD：横滚 +0.021、俯仰 +0.257、偏航 +0.138 °/s（俯仰、偏航轴与原始轴反号）
+    raw_data.gyro_offset[0] = 0.000361f;
+    raw_data.gyro_offset[1] = -0.004492f;
+    raw_data.gyro_offset[2] = -0.002414f;
+    // 原值。原版加计自检同样不过、停在 ±6g 并按 6g 换算，单位本来就是对的，不需要减半
+    raw_data.accel_offset[0] = 0.07f;
+    raw_data.accel_offset[1] = -0.17f;
     raw_data.accel_offset[2] = 0.0f;
 
     if (HAL_SPI_Init(&hspi1) != HAL_OK)

@@ -22,7 +22,7 @@ MODE_NAMES = {0: "待机", 1: "深度闭环", 2: "深度+偏航闭环", 3: "手�
 def _reset_cause(arg: int) -> str:
     parts = []
     if arg & 0x08:
-        parts.append("上电")
+        parts.append("上电/掉电（单片机 3.3 V 断过电；没动电源开关却出现就是供电被拉垮）")
     elif arg & 0x02:
         parts.append("欠压复位（电压被拉低，常见于推进器大电流）")
     if arg & 0x04 and not arg & 0x08:
@@ -64,6 +64,52 @@ class CodeInfo:
         return {1: "stop", 2: "warn", 3: "info", 9: "fatal"}.get(self.code // 100, "warn")
 
 
+_MODULE_NAMES = {"IMU": "IMU（陀螺/加计/磁力计）", "PRES": "水压计", "PROP": "推进器", "SERVO": "舵机", "LED": "LED"}
+
+
+def _i2c_status(arg: int) -> str:
+    arg &= 0xFFFFFFFF
+    count, sr1, sr2 = arg >> 20, (arg >> 8) & 0xFFF, arg & 0xFF
+    if count == 0:          # 旧固件格式：SR1 | SR2 << 16
+        count, sr1, sr2 = 1, arg & 0xFFFF, (arg >> 16) & 0xFFFF
+    bits = []
+    if sr2 & 0x02:
+        bits.append("总线一直忙(BUSY)")
+    if sr2 & 0x01:
+        bits.append("C 板还处在主机发送中、停止位没能发出去（线上有东西拉住 SDA/SCL）")
+    if sr1 & 0x0100:
+        bits.append("总线错误(BERR)")
+    if sr1 & 0x0200:
+        bits.append("仲裁丢失(ARLO)")
+    return (f"近 1 秒复位 {count} 次；{'、'.join(bits) or '状态异常'}（SR1=0x{sr1:03X} SR2=0x{sr2:02X}），"
+            "多半是推进器电流干扰")
+
+
+def _bmi088_error(arg: int, text: str) -> str:
+    parts = []
+    if arg & 0x80:
+        parts.append("加计自检未过")
+    if arg & 0x40:
+        parts.append("陀螺自检未过")
+    if arg & 0x3F:
+        parts.append(f"寄存器配置失败码 0x{arg & 0x3F:02X}")
+    detail = f"错误位 0x{arg & 0xFF:02X}（{'、'.join(parts) or '无'}）"
+    if text:
+        detail += f"；加计实际量程 ±{text}，已按此换算" if text != "?" else "；读不到加计量程，加速度可能不可信"
+    return detail
+
+
+_LEVEL_FAIL = {
+    1: "推进器在转，先 OFF 再标定",
+    2: "水不够深，至少 10 mbar（约 10 cm）",
+    3: "水压计读数无效（有通道读不到）",
+    4: "车在晃动，等静止后再标",
+    5: "结果超过 ±2 mbar，不合理，可能标定时车在动或水压计有问题",
+    6: "Flash 写入失败：本次偏置仍然生效，但断电后丢失",
+    7: "正在做水压零点标定（CA），已取消",
+}
+
+
 def _info(code, name, detail=None):
     return CodeInfo(code, name, detail)
 
@@ -94,11 +140,20 @@ CODES: dict[int, CodeInfo] = {c.code: c for c in [
     _info(211, "请求补发的事件已被覆盖", lambda a, t: f"下位机最早还保留第 {a} 条"),
     _info(212, "HAL 初始化 Error_Handler 被调用（程序继续运行）",
           lambda a, t: f"调用处地址 0x{a & 0xFFFFFFFF:08X}，用编译生成的 .map 文件查是哪个函数"),
-    _info(213, "BMI088 陀螺/加计初始化失败（继续运行，姿态不可信）",
-          lambda a, t: f"错误位 0x{a & 0xFF:02X}"),
+    _info(213, "BMI088 陀螺/加计自检或配置未通过（继续运行）",
+          lambda a, t: _bmi088_error(a, t)),
     _info(214, "IST8310 磁力计初始化失败（继续运行）", lambda a, t: f"错误码 {a}"),
     _info(215, "IMU SPI1 初始化失败"),
     _info(216, "舵机 PCA9685 写入失败", lambda a, t: f"舵机 {a}"),
+    _info(217, "串口接收意外停止，已重新开启", lambda a, t: f"重开结果 {['成功', 'HAL_ERROR', 'HAL_BUSY', 'HAL_TIMEOUT'][a] if 0 <= a <= 3 else a}"),
+    _info(218, "控制任务被某个模块卡住（期间遥测、心跳检查、停机都没执行）",
+          lambda a, t: f"{_MODULE_NAMES.get(t, t)} 一次用了 {a} ms（正常整周期 < 7 ms；水压标定时约 2 s 属正常）"),
+    _info(219, "串口发送卡住，已强制重启发送", lambda a, t: f"丢弃 {a} 字节（事件会自动补发）"),
+    _info(220, "I2C2 总线（推进器/水压计）卡死，已复位总线",
+          lambda a, t: _i2c_status(a)),
+    _info(221, "供电跌落", lambda a, t: (f"C 板输入电压降到 {a / 1000:.2f} V（低于空闲时的 60%）" if t == "VIN"
+                                          else f"单片机 3.3 V 降到 {a / 1000:.3f} V") + "，推进器电流把电源拉低了"),
+    _info(222, "水下水平标定没做成，偏置保持原样", lambda a, t: _LEVEL_FAIL.get(a, f"原因 {a} {t}")),
     # ---- 3xx 信息 ----
     _info(301, "下位机上电/复位", lambda a, t: _reset_cause(a)),
     _info(302, "ON：深度闭环开启", lambda a, t: f"目标深度 {a / 10:.1f} mbar（约 cm）"),
@@ -110,6 +165,11 @@ CODES: dict[int, CodeInfo] = {c.code: c for c in [
     _info(308, "水压计零点标定开始（约 2 s 内控制暂停）"),
     _info(309, "水压计零点", lambda a, t: f"{t} = {a / 1000:.3f} mbar"),
     _info(310, "水压计零点标定结束"),
+    _info(311, "闭环反馈来源切换", lambda a, t: "四路水压差（与原版相同）" if a == 0 else "ESKF 融合"),
+    _info(312, "水下水平标定开始", lambda a, t: f"约 {a / 1000:.0f} s，期间保持静止、不要碰车"),
+    _info(313, "水压计水下偏置", lambda a, t: f"{SENSOR_NAMES.get(int(t[2:]) if t.startswith('CH') and t[2:].isdigit() else -1, t)} = {a / 1000:+.3f} mbar"),
+    _info(314, "水下偏置已生效", lambda a, t: {"LOAD": "上电读取：", "SAVE": "标定完成并写入 Flash：", "DEF": "已恢复默认："}.get(t, "")
+          + ("LVL 标定值" if a == 1 else "程序默认值（10-20 沉底数据）")),
     # ---- 9xx 致命 ----
     _info(901, "HardFault（单片机已停止）",
           lambda a, t: f"出错指令地址 0x{a & 0xFFFFFFFF:08X}（0 表示发生在中断里）；{t}"),

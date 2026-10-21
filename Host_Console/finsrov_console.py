@@ -9,7 +9,7 @@
 事件
 按下位机序号排列；串口丢行会自动请求补发；下位机重启会另起一段。
 上位机自己的操作（发 ON/OFF、断线……）以蓝色气泡显示在右侧，时间按下位机时间估算插入。
-所有记录同时写入 logs/ 目录。
+所有记录同时写入 logs/ 目录；曲线和状态数据另存为 CSV，放在 log_csv/ 目录。
 """
 
 from __future__ import annotations
@@ -24,12 +24,15 @@ from tkinter import filedialog, messagebox, ttk
 
 import fins_codes
 import fins_protocol
-from fins_chart import StripChart
+import webbrowser
+
+from fins_web import ScopeServer
+from fins_csv import TelemetryCsv
 from fins_gamepad import Gamepad, load_mapping
 from fins_link import SerialLink, list_ports
 
 TICK_MS = 33                      # 界面 / 手柄刷新约 30 Hz（与原上位机一致）
-TELEMETRY_LOST_S = 2.0            # 推进器在动但 2 s 没收到状态行 → 上位机主动发 OFF
+TELEMETRY_LOST_S = 2.0            # 推进器在动但 2 s 没收到状态行 → 只提示，不发 OFF（2026-10-13 按要求取消自动停机）
 NEUTRAL_PWM = 1550
 
 COLORS = {
@@ -60,6 +63,8 @@ class Console:
         logs.mkdir(exist_ok=True)
         self.log_path = logs / f"finsrov_{dt.datetime.now():%Y%m%d_%H%M%S}.log"
         self.log_file = self.log_path.open("a", encoding="utf-8")
+        self.csv = TelemetryCsv(Path(__file__).with_name("log_csv"))
+        self.scope = ScopeServer()      # 曲线窗口（浏览器打开，仿 Scope）
         self.link = SerialLink()
         self.tracker = fins_protocol.EventTracker(self._on_tracker_change)
         self.gamepad = Gamepad(load_mapping(args.mapping), log=self.note)
@@ -81,8 +86,11 @@ class Console:
         self._build_ui()
         self._bind_keys()
         # 初始把右侧上下按约 6:4 分（之后可以拖动分隔条）
-        self.root.after(300, lambda: self.right_pane.sashpos(0, int(self.right_pane.winfo_height() * 0.58)))
-        self.note("上位机已启动，日志：logs/" + self.log_path.name, "host")
+        if self.scope.url:
+            self.root.after(800, self.open_scope)
+        else:
+            self.note("曲线窗口启动失败：本机 8765~8784 端口都被占用", "warn")
+        self.note("上位机已启动，日志：logs/" + self.log_path.name + "，曲线数据：log_csv/" + self.csv.path.name, "host")
         if args.port:
             self.port_var.set(args.port)
             self.toggle_connect()
@@ -139,6 +147,7 @@ class Console:
         self.link_label.pack(side="left", padx=12)
         self.telemetry_label = ttk.Label(top, text="", style="Muted.TLabel")
         self.telemetry_label.pack(side="left", padx=6)
+        ttk.Button(top, text="曲线窗口", command=self.open_scope).pack(side="right")
         self.refresh_ports()
 
         ttk.Separator(root).pack(fill="x")
@@ -149,17 +158,10 @@ class Console:
         body.rowconfigure(0, weight=1)
 
         self._build_status(body)
-        # 右侧：上曲线、下事件记录，中间分隔条可上下拖动
-        self.right_pane = ttk.PanedWindow(body, orient="vertical")
-        self.right_pane.grid(row=0, column=1, sticky="nsew")
-        self.chart = StripChart(self.right_pane, {"normal": self.f_normal, "small": self.f_small,
-                                                  "bold": self.f_bold})
-        self.right_pane.add(self.chart, weight=3)
-        chat_holder = ttk.Frame(self.right_pane)
-        self.right_pane.add(chat_holder, weight=2)
+        # 右侧：事件记录。曲线在单独的"曲线窗口"（浏览器，仿 Scope），顶栏按钮可重新打开
+        chat_holder = ttk.Frame(body)
+        chat_holder.grid(row=0, column=1, sticky="nsew")
         self._build_chat(chat_holder)
-        style = ttk.Style(self.root)
-        style.configure("Sash", sashthickness=8, gripcount=12)
 
     def _kv(self, parent, row, label, var_name, font=None):
         ttk.Label(parent, text=label, style="Panel.TLabel", foreground=COLORS["muted"]).grid(
@@ -199,6 +201,12 @@ class Console:
         ttk.Button(buttons, text="锁定航向", command=self.cmd_yaw_on).grid(row=2, column=0, sticky="ew", padx=2, pady=2)
         ttk.Button(buttons, text="关闭航向", command=lambda: self.send("RPY:OFF")).grid(row=2, column=1, sticky="ew", padx=2, pady=2)
         ttk.Button(buttons, text="水压标定", command=self.cmd_calibrate).grid(row=2, column=2, sticky="ew", padx=2, pady=2)
+        ttk.Button(buttons, text="水下水平标定", command=self.cmd_level).grid(
+            row=3, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
+        ttk.Button(buttons, text="偏置恢复默认", command=self.cmd_level_default).grid(
+            row=3, column=2, sticky="ew", padx=2, pady=2)
+        self.feedback_button = ttk.Button(buttons, text="反馈：--", command=self.cmd_toggle_feedback)
+        self.feedback_button.grid(row=4, column=0, columnspan=3, sticky="ew", padx=2, pady=2)
 
         entry_row = ttk.Frame(left, style="Panel.TFrame")
         entry_row.grid(row=22, column=0, columnspan=2, sticky="ew", pady=(8, 0))
@@ -343,6 +351,15 @@ class Console:
         else:
             self.cmd_yaw_on()
 
+    def cmd_toggle_feedback(self) -> None:
+        # 姿态/深度闭环的反馈来源：水压差（与原版相同，默认）⇄ ESKF；推进器工作时也可以切
+        session = self.tracker.current
+        status = session.last_status if session else None
+        if status is None or status.feedback_eskf < 0:
+            messagebox.showinfo("反馈切换", "还没收到下位机状态，或下位机固件不支持（需 10-19 之后的固件）。")
+            return
+        self.send("FB:PRS" if status.feedback_eskf == 1 else "FB:ESKF")
+
     def cmd_calibrate(self) -> None:
         if self.board_mode() not in (0, None):
             messagebox.showwarning("水压标定", "推进器在工作时不能标定，请先 OFF。")
@@ -350,6 +367,25 @@ class Console:
         if messagebox.askokcancel("水压标定", "标定会把当前读数当作水面零点。\n"
                                               "请确认四个水压计口都在空气中、潜器静止。继续？"):
             self.send("CA")
+
+    def cmd_level(self) -> None:
+        # LVL：水下静止时以加速度计姿态为准，重新测四路水压计的水下偏置（安装高度差），存 Flash
+        if self.board_mode() not in (0, None):
+            messagebox.showwarning("水下水平标定", "推进器在工作时不能标定，请先 OFF。")
+            return
+        if messagebox.askokcancel("水下水平标定",
+                                  "条件：潜器在水下至少 10 cm（沉底或静止都行）、已泡 3~5 分钟、推进器 OFF。\n"
+                                  "下位机测 5 秒，期间不要碰车；结束时写 Flash，单片机会停顿 1~2 秒（遥测短暂中断属正常）。\n"
+                                  "结果以加速度计为准，以后改了加速度计零偏要重新标一次。继续？"):
+            self.send("LVL")
+
+    def cmd_level_default(self) -> None:
+        if self.board_mode() not in (0, None):
+            messagebox.showwarning("偏置恢复默认", "推进器在工作时不能操作，请先 OFF。")
+            return
+        if messagebox.askokcancel("偏置恢复默认", "把四路水压计的水下偏置恢复为程序默认值（10-20 沉底数据测得），"
+                                                "并清掉 Flash 里的标定结果。单片机会停顿 1~2 秒。继续？"):
+            self.send("LVL:DEF")
 
     def send_free_command(self) -> None:
         command = self.command_var.get().strip()
@@ -394,12 +430,18 @@ class Console:
             return
         if kind == "session":
             self._write_log(f"==== 下位机会话 {session.index} ====")
+            previous = self.tracker.sessions[-2] if len(self.tracker.sessions) >= 2 else None
+            if previous is not None and previous.last_status is not None and previous.last_status.active \
+                    and previous.fatal is None:
+                self.note("下位机在推进器工作时突然重启：多半是推进器电流把单片机供电拉垮（看分隔线上的复位原因，"
+                          "是\"上电/掉电\"就是断过电）。重启后推进器回中位，需要重新 ON", "warn")
             self.request_full_render()
             return
         if kind == "fatal":
             self._write_log(f"[FATAL] 板上 {board_time(item.t_ms)} 代码 {item.code}")
             return
         if kind == "event":
+            self.scope.publish_event(item, session.index)
             self._write_log(f"#{item.seq} 板上 {board_time(item.t_ms)} {item.code} {item.title}"
                             + (f" — {item.detail}" if item.detail else ""))
             key = (session.index, item.t_ms, 0, item.seq)
@@ -526,8 +568,6 @@ class Console:
             self._process_inputs(now)
             self._update_status(now)
             self._tick_count += 1
-            if self._tick_count % 3 == 0 and not self.chart._mouse:
-                self.chart.render()          # 约 10 Hz 重画曲线（鼠标悬停时由移动事件重画）
             if self._render_all_pending:
                 self._render_all()
         finally:
@@ -541,15 +581,24 @@ class Console:
                 break
             if kind == "line":
                 item = self.tracker.handle_line(text, pc_time)
+                session = self.tracker.current
+                index = session.index if session else 0
                 if isinstance(item, fins_protocol.PlotSample):
-                    self.chart.push(item.t_ms, item.values)
+                    self.scope.publish_plot(item.t_ms, item.values, index)
+                    self.csv.on_plot(item, index)
                 elif isinstance(item, fins_protocol.Status):
-                    self.chart.push_pwm(item.t_ms, item.pwm)
+                    self.scope.publish_status(item, index)
+                    self.csv.on_status(item)
+                elif isinstance(item, fins_protocol.PidSample):
+                    self.scope.publish_plot(item.t_ms, item.values, index)
+                    self.csv.on_pid(item)
             elif kind == "link_up":
+                self.scope.set_connected(True)
                 self.note(text, "host")
                 self.telemetry_lost_reported = False
                 self.link.send("EVQ:1")      # 连上就请求从头补发本次上电的所有事件
             elif kind in ("link_down", "link_fail"):
+                self.scope.set_connected(False)
                 if kind == "link_down" or not getattr(self, "_last_fail_text", "") == text:
                     self.note(text, "warn")
                 self._last_fail_text = text
@@ -558,19 +607,20 @@ class Console:
             self.link.send(f"EVQ:{seq}")
             self.resend_requests += 1
 
-        # 上位机侧保护：推进器在动但 2 s 收不到状态行
+        # 推进器在动但 2 s 收不到状态行：只提示，不自动停机（下位机自己的心跳保护照常有效）
         session = self.tracker.current
         status = session.last_status if session else None
         if status is not None and status.active and session.fatal is None:
             if now - status.pc_time > TELEMETRY_LOST_S and not self.telemetry_lost_reported:
                 self.telemetry_lost_reported = True
-                if self.link.connected:
-                    for _ in range(3):
-                        self.link.send("OFF")
-                self.note(f"遥测中断超过 {TELEMETRY_LOST_S:.0f} s，推进器最后状态是在工作，上位机已发送 OFF"
-                          + ("" if self.link.connected else "（串口已断开，发不出去！）"), "warn")
-        if status is not None and now - status.pc_time < 0.5:
+                self.telemetry_lost_since = status.pc_time
+                self.note(f"遥测中断超过 {TELEMETRY_LOST_S:.0f} s（推进器最后状态在工作；上位机不自动停机，"
+                          "需要时手动按急停）" + ("" if self.link.connected else "（串口已断开！）"), "warn")
+        if status is not None and now - status.pc_time < 0.5 and self.telemetry_lost_reported:
             self.telemetry_lost_reported = False
+            gap = status.pc_time - getattr(self, "telemetry_lost_since", status.pc_time)
+            self.note(f"遥测恢复，中断约 {gap:.1f} s。中断期间下位机记下的事件会自动补发、按板上时间插在上面"
+                      "（重点看 218 模块卡住、220 I2C 总线复位、301 重启）", "host")
 
     def _process_inputs(self, now: float) -> None:
         pad = self.gamepad.poll(now)
@@ -589,7 +639,7 @@ class Console:
             self.servo[2] = self.servo[3] = 1500
             self.servo_dirty = True
 
-        # 上浮/下潜：按下发一次，按住 0.5 s 后每 0.2 s 再发
+        # 上浮/下潜：按下发一次，按住 0.5 s 后每 0.4 s 再发（2026-10-20 由 0.2 s 改慢一半，目标深度约 2.5 mbar/s）
         for name, key, command in (("ascend", "r", "UP"), ("descend", "f", "DN")):
             held = name in pad.held or key in self.keys_held
             if held:
@@ -600,7 +650,7 @@ class Console:
                         self.send(command)
                 elif now - since > 0.5:
                     self.send(command)
-                    self.depth_hold_since[command] = now - 0.3
+                    self.depth_hold_since[command] = now - 0.1
             else:
                 self.depth_hold_since.pop(command, None)
 
@@ -696,10 +746,14 @@ class Console:
                 text=f"下位机 {silent_s:.2f} s 未收到数据" + ("（超过 0.67 s 会停机）" if silent_s > 0.3 else ""),
                 fg=COLORS["warn"] if silent_s > 0.3 else COLORS["text"])
             self.v_depth.configure(text=f"当前 {status.depth_x10 / 10:.1f}   目标 {status.target_x10 / 10:.1f}  mbar")
+            feedback = {0: "水压差", 1: "ESKF"}.get(status.feedback_eskf, "--")
             self.v_attitude.configure(
                 text=f"横滚 {status.roll_cd / 100:+.1f}°  俯仰 {status.pitch_cd / 100:+.1f}°  "
-                     f"偏航 {status.yaw_cd / 100:+.1f}°\n来源 {'ESKF 融合' if status.attitude_from_eskf else 'IMU（ESKF 未就绪）'}"
-                     "  · 抬头/右倾/顺时针为正")
+                     f"偏航 {status.yaw_cd / 100:+.1f}°\n显示来源 {'ESKF 融合' if status.attitude_from_eskf else 'IMU（ESKF 未就绪）'}"
+                     f"  · 闭环反馈 {feedback}  · 抬头/右倾/顺时针为正")
+            other = {0: "ESKF", 1: "水压差"}.get(status.feedback_eskf)
+            self.feedback_button.configure(
+                text=f"闭环反馈：{feedback}（点击切到 {other}）" if other else "闭环反馈：--")
             self.v_motion.configure(text=fins_codes.MOTION_NAMES.get(status.motion, str(status.motion)))
             dots = "  ".join(("●" if status.pressure_mask & (1 << i) else "○") + fins_codes.SENSOR_NAMES[i][3:]
                              for i in range(4))
@@ -720,10 +774,16 @@ class Console:
             text=f"收到 {self.tracker.lines_ok} 行 · 校验错误 {self.tracker.checksum_errors} · "
                  f"补发请求 {self.resend_requests} · 当前缺号 {missing} · 日志 {self.log_path.name}")
 
+    def open_scope(self) -> None:
+        if self.scope.url:
+            webbrowser.open(self.scope.url)
+
     def on_close(self) -> None:
         if self.link.connected:
             self.note("关闭上位机：发送 OFF", "host")
         self.link.stop(send_off=True)
+        self.csv.close()
+        self.scope.close()
         try:
             self.log_file.close()
         except OSError:

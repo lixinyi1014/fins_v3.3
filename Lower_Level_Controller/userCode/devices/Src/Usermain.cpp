@@ -64,6 +64,9 @@ static Device *device[] = {
 // Macro definition for the number of devices.
 // 定义设备数量宏
 #define DEVICE_NUM (sizeof(device) / sizeof(device[0]))
+// 与上面 device[] 一一对应的名称（只用 ASCII，事件 218 上报"哪个模块卡住"用；改 device[] 时同步改）
+static const char *const device_names[] = {"IMU", "PRES", "PROP", "SERVO", "LED"};
+static_assert(sizeof(device_names) / sizeof(device_names[0]) == DEVICE_NUM, "device_names 要和 device[] 一一对应");
 
 volatile bool system_init_flag = false;
 volatile bool tick_300hz = false;
@@ -96,12 +99,36 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t datasize)//H
          */
         if (datasize > 0 && !CommandQueue_PushFromISR(uart_rx_buffer, datasize))
         {
-            Event_PostLimited(EV_WARN_CMD_OVERFLOW, datasize, 1000);
+            // 缓冲满时丢掉的若只是心跳 "HB"，不用报：缓冲里已有数据，本周期照样算收到心跳（水压标定阻塞约 2 s 时必然发生）
+            const bool heartbeat_only = datasize <= 4 && uart_rx_buffer[0] == 'H' && uart_rx_buffer[1] == 'B';
+            if (!heartbeat_only)
+                Event_PostLimited(EV_WARN_CMD_OVERFLOW, datasize, 1000);
         }
         // Re-enable UART reception.
         // 重新开启接收
         HAL_UARTEx_ReceiveToIdle_IT(&huart6, uart_rx_buffer, SERIAL_LENGTH_MAX);
     }
+}
+
+/*
+ * 控制任务每周期调用：USART6 若不在接收状态（中断里重开失败等），在这里补开并上报 217。
+ */
+void Uart6_EnsureReceiving(void)
+{
+    if (huart6.RxState != HAL_UART_STATE_READY)
+        return;
+    const uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    HAL_StatusTypeDef status = HAL_BUSY;
+    const bool idle = huart6.RxState == HAL_UART_STATE_READY;
+    if (idle)
+    {
+        __HAL_UART_CLEAR_OREFLAG(&huart6);
+        status = HAL_UARTEx_ReceiveToIdle_IT(&huart6, uart_rx_buffer, SERIAL_LENGTH_MAX);
+    }
+    __set_PRIMASK(primask);
+    if (idle)
+        Event_PostLimited(EV_WARN_UART_RX_RESTART, static_cast<int32_t>(status), 1000);
 }
 
 /*
@@ -237,6 +264,8 @@ int main(void) {
     for(int i = 0; i < DEVICE_NUM; ++i){
         device[i] -> Init();
     }
+    // LVL 水下水平标定：推进器在转时不标定、不写 Flash
+    PressureSensor::pressure_sensor.SetLevelGuard([]() -> bool { return propeller_i2c.IsActive(); });
     /*
      * 先创建设备任务。
      *
@@ -245,7 +274,7 @@ int main(void) {
      * 2. imu_queue
      * 3. pressure_queue
      */
-    StartControllerTask(device, DEVICE_NUM);
+    StartControllerTask(device, DEVICE_NUM, device_names);
 
     /*
      * 再创建负责读取传感器队列的 SensorTask。
@@ -255,6 +284,8 @@ int main(void) {
     /*
      * 所有设备初始化完成后再开启串口接收（原来分散在推进器、舵机的 Init 里）。
      */
+    // 初始化期间上位机的心跳已经在发，串口早就溢出(ORE)了；先清掉，否则一开接收就报一次 207
+    __HAL_UART_CLEAR_OREFLAG(&huart6);
     HAL_UARTEx_ReceiveToIdle_IT(&huart6, uart_rx_buffer, SERIAL_LENGTH_MAX);
 
     // Set the initialization-complete flag.

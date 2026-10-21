@@ -15,10 +15,14 @@
 #include "Usermain.h"
 struct PressureSample;
 struct ImuSample;
-void StartControllerTask(Device *devices[], uint32_t count);
+void StartControllerTask(Device *devices[], uint32_t count, const char *const *names = nullptr); // names：与 devices 一一对应的 ASCII 名称，可省略
 //这个函数由 TIM1 定时器中断调用。
 //它只负责通知任务，不负责执行设备处理。
 void ControllerTickFromISR(void);
+// USART6 不在接收状态时补开（实现在 Usermain.cpp，控制任务每周期调用）
+void Uart6_EnsureReceiving(void);
+// 模块在 Handle() 里要做已知的长操作（水压标定约 2.4 s）前调用，本周期不报 218"控制任务被卡住"
+void Controller_ExpectLongStep(void);
 bool WaitPressureSample(PressureSample *sample, uint32_t timeout_ms);
 bool WaitImuSample(ImuSample *sample, uint32_t timeout_ms);
 /*

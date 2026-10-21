@@ -1,6 +1,10 @@
 #include "Sensor.h"
 #include "Kalman_filter.h"
 #include "EventLog.h"
+#include "ControllerTask.h"
+#include "IMU.h"
+#include <math.h>
+#include <string.h>
 
 extern I2C_HandleTypeDef hi2c2;
 
@@ -47,6 +51,7 @@ void PressureSensor::Init()
 
     pressure_frame_id = 0;
     pressure_valid_mask_ = 0;
+    LevelLoad(); // 水下偏置：Flash 里有 LVL 标定结果就用，否则用程序默认值
     /*quat[0]=1.0f;
     quat[1]=0.0f;
     quat[2]=0.0f;
@@ -61,12 +66,19 @@ void PressureSensor::Handle()
 
     if (flag_calibrate)
     {
+        if (level_cal_active_)
+            LevelCalFail(7, "CA");
+        Controller_ExpectLongStep(); // 标定本来就要约 2.4 s，不当成"控制任务被卡住"报 218
         Calibrate(); // Calibration 校准
         flag_calibrate = false;
+        // 标定时每一路的转换结果都已被读走，三段采样必须从头开始；
+        // 否则若标定前停在"读压力"阶段，下一帧读到的是 0，四路都报 201
+        ps_state = PS_HANDLE_STATE::GET_TEMPERATURE;
     }
     else
     {
         Handle_all();
+        LevelCalStep();
     }
     /*
     Update_plane();//计算机器人参考系下水面方程
@@ -81,7 +93,9 @@ void PressureSensor::Handle()
 
 void PressureSensor::Receive()
 {
-    if (strncmp((char *)RxBuffer, "CA", 2) == 0) flag_calibrate = true;
+    if (strncmp((char *)RxBuffer, "LVL:DEF", 7) == 0) LevelResetDefault();
+    else if (strncmp((char *)RxBuffer, "LVL", 3) == 0) LevelCalStart();
+    else if (strncmp((char *)RxBuffer, "CA", 2) == 0) flag_calibrate = true;
     else if (strncmp((char *)RxBuffer, "VA", 2) == 0) flag_read_pres = true;
 }
 bool PressureSensor::CopyLatestSample(
@@ -222,7 +236,7 @@ void PressureSensor::MS5837_30BA_ReSet(void)
 {
     uint8_t data[1];
     data[0] = MS5837_30BA_ResetCommand;
-    HAL_I2C_Master_Transmit(&hi2c2, B02_IIC_ADDRESS, data, 1, 0xffff);
+    HAL_I2C_Master_Transmit(&hi2c2, B02_IIC_ADDRESS, data, 1, EXT_I2C_TIMEOUT_MS);
 }
 
 uint8_t PressureSensor::MS5837_30BA_PROM(int id)
@@ -236,8 +250,8 @@ uint8_t PressureSensor::MS5837_30BA_PROM(int id)
     for (i = 0; i < 7; i++)
     {
         memaddr[0] = MS5837_30BA_PROM_RD + (i * 2);
-        HAL_I2C_Master_Transmit(&hi2c2, B02_IIC_ADDRESS, memaddr, 1, 0xffff);
-        HAL_I2C_Master_Receive(&hi2c2, B02_IIC_ADDRESS, data, 2, 0xffff);
+        HAL_I2C_Master_Transmit(&hi2c2, B02_IIC_ADDRESS, memaddr, 1, EXT_I2C_TIMEOUT_MS);
+        HAL_I2C_Master_Receive(&hi2c2, B02_IIC_ADDRESS, data, 2, EXT_I2C_TIMEOUT_MS);
         Cal_C[id][i] = (((uint16_t)data[0] << 8) | data[1]);
     }
     return !Cal_C[id][0];
@@ -248,12 +262,12 @@ unsigned long PressureSensor::MS5837_30BA_GetConversion(uint8_t command)
     unsigned long conversion = 0;
     uint8_t data = MS5837_30BA_ADC_RD;
     uint8_t temp[3];
-    HAL_I2C_Master_Transmit(&hi2c2, B02_IIC_ADDRESS, &command, 1, 0xffff);
+    HAL_I2C_Master_Transmit(&hi2c2, B02_IIC_ADDRESS, &command, 1, EXT_I2C_TIMEOUT_MS);
     HAL_Delay(2);
     // Delay_us(15000);
-    HAL_I2C_Master_Transmit(&hi2c2, B02_IIC_ADDRESS, &data, 1, 0xffff);
+    HAL_I2C_Master_Transmit(&hi2c2, B02_IIC_ADDRESS, &data, 1, EXT_I2C_TIMEOUT_MS);
 
-    HAL_I2C_Master_Receive(&hi2c2, B02_IIC_ADDRESS, temp, 3, 0xffff);
+    HAL_I2C_Master_Receive(&hi2c2, B02_IIC_ADDRESS, temp, 3, EXT_I2C_TIMEOUT_MS);
     conversion = (unsigned long)temp[0] * 65536 + (unsigned long)temp[1] * 256 + (unsigned long)temp[2];
     return conversion;
 }
@@ -511,6 +525,7 @@ void PressureSensor::Handle_all()
      *
      * 三个阶段完成后，才算得到一帧完整的压力数据。
      */
+    I2C2_RecoverIfStuck(); // 上一周期总线若被干扰卡住，先复位再采样
     switch (ps_state) {
         case PS_HANDLE_STATE::GET_TEMPERATURE:
             // Notify the sensor to prepare temperature data.
@@ -614,6 +629,12 @@ void PressureSensor::Handle_all()
              * 无效通道保持上一帧结果（沿用上一次成功值），
              * 这样不会破坏原有闭环控制接口。
              */
+            // 水下偏置权重：按上一帧平均深度，2 mbar 以下 0（空气中没有水柱差，不该扣），5 mbar 以上 1
+            // （ESKF 从 5 cm 水深开始用压差）。四路用同一个权重、偏置之和为 0，所以深度不变
+            {
+                const float w = (data_depth - 2.0f) / 3.0f;
+                level_weight_ = isfinite(w) ? (w < 0.0f ? 0.0f : (w > 1.0f ? 1.0f : w)) : 0.0f;
+            }
             for (int i = 0; i < SENSOR_NUM; ++i)
             {
                 const uint8_t current_bit =
@@ -643,8 +664,9 @@ void PressureSensor::Handle_all()
                 tmp_pres =
                     Pressure_Kf[i].update(tmp_pres);
 
+                pressure_no_level_[i] = tmp_pres;
                 data_pressure[i] =
-                    tmp_pres;
+                    tmp_pres - level_weight_ * level_offset_mbar[i];
             }
             pressure_valid_mask_ = frame_valid_mask;
             ++pressure_frame_id;
@@ -787,4 +809,202 @@ void Sonar::Receive()
         data = -1;
 
     // HAL_UARTEx_ReceiveToIdle_IT(&huart6, RxBuffer, SERIAL_LENGTH_MAX);
+}
+/* ======================================================================
+ * 水下偏置 / LVL 水下水平标定（2026-10-20）
+ *
+ * 2026-10-20 沉底 14 分钟的数据：以加速度计姿态为准，四路水压计各自多读了
+ * -0.14 / -0.27 / +0.03 / +0.38 mbar（约等于安装高度差 1.4 / 2.8 / 0.3 / 3.9 mm），
+ * 18 mbar 悬停和 90 mbar 沉底时基本一样大，是固定偏差而不是灵敏度差。
+ * 它让水压差算出的横滚多 1.8°、俯仰多 -0.57°，ESKF 也被拉偏约 25%。
+ * ====================================================================== */
+namespace
+{
+    // 程序默认值（上面那次数据 900~1270 s 的平均），之和为 0
+    const float kLevelDefaultMbar[SENSOR_NUM] = {-0.142f, -0.270f, 0.028f, 0.384f};
+    constexpr uint32_t kLevelMagic = 0x4C564C31u;  // "LVL1"
+    constexpr float kLevelMaxAbsMbar = 2.0f;       // 超过 2 mbar（约 2 cm 高度差）肯定不对
+    constexpr uint32_t kLevelCalMs = 5000;         // 标定时长
+    constexpr float kLevelMinDepthMbar = 10.0f;    // 至少这么深才标
+    constexpr float kLevelMaxGyroRad = 0.05f;      // 约 3°/s，超过算车在动
+    // 水压计相对舱体位置，与 ESKF / Propeller 相同：0 左前 1 左后 2 右后 3 右前，FRD
+    constexpr float kLevelHalfX_m = 0.1247f;
+    constexpr float kLevelHalfY_m = 0.0691f;
+    const float kLevelX[SENSOR_NUM] = {kLevelHalfX_m, -kLevelHalfX_m, -kLevelHalfX_m, kLevelHalfX_m};
+    const float kLevelY[SENSOR_NUM] = {-kLevelHalfY_m, -kLevelHalfY_m, kLevelHalfY_m, kLevelHalfY_m};
+    constexpr float kMbarPerMeter = 1000.0f * 9.80665f / 100.0f; // 98.07 mbar/m（与 pressure_to_depth 一致）
+    const char *const kChannelText[SENSOR_NUM] = {"CH0", "CH1", "CH2", "CH3"};
+
+    uint32_t LevelCheckWord(const flash_data_t &d)
+    {
+        uint32_t c = d.level_magic ^ 0xA5A5A5A5u;
+        for (int i = 0; i < SENSOR_NUM; ++i)
+        {
+            uint32_t w;
+            memcpy(&w, &d.level_offset_mbar[i], sizeof(w));
+            c = ((c << 5) | (c >> 27)) ^ w;
+        }
+        return c;
+    }
+
+    // 四路减去平均值，保证之和为 0（深度不受影响）
+    void CenterOffsets(float v[SENSOR_NUM])
+    {
+        float mean = 0.0f;
+        for (int i = 0; i < SENSOR_NUM; ++i) mean += v[i];
+        mean /= SENSOR_NUM;
+        for (int i = 0; i < SENSOR_NUM; ++i) v[i] -= mean;
+    }
+}
+
+void PressureSensor::LevelLoad()
+{
+    // flashData 已在 Init 开头 bsp_flash_read
+    bool from_flash = flashData.level_magic == kLevelMagic && flashData.level_check == LevelCheckWord(flashData);
+    for (int i = 0; from_flash && i < SENSOR_NUM; ++i)
+    {
+        const float v = flashData.level_offset_mbar[i];
+        if (!isfinite(v) || fabsf(v) > kLevelMaxAbsMbar)
+            from_flash = false;
+    }
+    for (int i = 0; i < SENSOR_NUM; ++i)
+        level_offset_mbar[i] = from_flash ? flashData.level_offset_mbar[i] : kLevelDefaultMbar[i];
+    CenterOffsets(level_offset_mbar);
+    for (int i = 0; i < SENSOR_NUM; ++i)
+        Event_PostText(EV_INFO_LEVEL_RESULT, static_cast<int32_t>(lroundf(level_offset_mbar[i] * 1000.0f)), kChannelText[i]);
+    Event_PostText(EV_INFO_LEVEL_DONE, from_flash ? 1 : 0, "LOAD");
+}
+
+bool PressureSensor::LevelSave(bool from_calibration)
+{
+    if (LevelBlocked())
+        return false;
+    flashData.level_magic = from_calibration ? kLevelMagic : 0u; // 恢复默认时让 Flash 里的结果失效
+    for (int i = 0; i < SENSOR_NUM; ++i)
+        flashData.level_offset_mbar[i] = level_offset_mbar[i];
+    flashData.level_check = LevelCheckWord(flashData);
+    Controller_ExpectLongStep(); // 擦扇区约 1~2 s，不当成控制任务卡住报 218
+    return bsp_flash_write(&flashData);
+}
+
+void PressureSensor::LevelCalFail(int32_t reason, const char *text)
+{
+    level_cal_active_ = false;
+    Event_PostText(EV_WARN_LEVEL_FAIL, reason, text);
+}
+
+void PressureSensor::LevelCalStart()
+{
+    if (LevelBlocked()) { Event_PostText(EV_WARN_LEVEL_FAIL, 1, "ACTIVE"); return; }
+    if (flag_calibrate) { Event_PostText(EV_WARN_LEVEL_FAIL, 7, "CA"); return; }
+    if (!(data_depth >= kLevelMinDepthMbar)) { Event_PostText(EV_WARN_LEVEL_FAIL, 2, "SHALLOW"); return; }
+    if ((pressure_valid_mask_ & 0x0Fu) != 0x0Fu) { Event_PostText(EV_WARN_LEVEL_FAIL, 3, "INVALID"); return; }
+
+    for (int i = 0; i < SENSOR_NUM; ++i) level_sum_p_[i] = 0.0;
+    for (int i = 0; i < 3; ++i) level_sum_down_[i] = 0.0;
+    level_cal_frames_ = 0;
+    level_cal_bad_frames_ = 0;
+    level_cal_last_frame_ = pressure_frame_id;
+    level_cal_start_ms_ = HAL_GetTick();
+    level_cal_active_ = true;
+    Event_Post(EV_INFO_LEVEL_START, static_cast<int32_t>(kLevelCalMs));
+}
+
+void PressureSensor::LevelResetDefault()
+{
+    if (LevelBlocked()) { Event_PostText(EV_WARN_LEVEL_FAIL, 1, "ACTIVE"); return; }
+    level_cal_active_ = false;
+    for (int i = 0; i < SENSOR_NUM; ++i)
+        level_offset_mbar[i] = kLevelDefaultMbar[i];
+    CenterOffsets(level_offset_mbar);
+    for (int i = 0; i < SENSOR_NUM; ++i)
+        Event_PostText(EV_INFO_LEVEL_RESULT, static_cast<int32_t>(lroundf(level_offset_mbar[i] * 1000.0f)), kChannelText[i]);
+    if (!LevelSave(false))
+        Event_PostText(EV_WARN_LEVEL_FAIL, 6, "FLASH");
+    Event_PostText(EV_INFO_LEVEL_DONE, 0, "DEF");
+}
+
+void PressureSensor::LevelCalStep()
+{
+    if (!level_cal_active_ || pressure_frame_id == level_cal_last_frame_)
+        return;
+    level_cal_last_frame_ = pressure_frame_id;
+
+    if (LevelBlocked()) { LevelCalFail(1, "ACTIVE"); return; }
+    if (!(data_depth >= kLevelMinDepthMbar)) { LevelCalFail(2, "SHALLOW"); return; }
+
+    ImuSample imu = {};
+    if ((pressure_valid_mask_ & 0x0Fu) != 0x0Fu || !IMU::imu.CopyLatestSample(&imu))
+    {
+        ++level_cal_bad_frames_;
+    }
+    else
+    {
+        const float gyro = sqrtf(imu.gyro_[0] * imu.gyro_[0] + imu.gyro_[1] * imu.gyro_[1] + imu.gyro_[2] * imu.gyro_[2]);
+        const float a_norm = sqrtf(imu.accel_[0] * imu.accel_[0] + imu.accel_[1] * imu.accel_[1] + imu.accel_[2] * imu.accel_[2]);
+        if (!isfinite(gyro) || gyro > kLevelMaxGyroRad || !isfinite(a_norm) || fabsf(a_norm - 9.8f) > 0.5f)
+        {
+            LevelCalFail(4, "MOVING");
+            return;
+        }
+        // IMU 原始轴 -> FRD"向下"方向，与 SensorTask::ConvertImuToBody 相同：down = (-a0, a1, a2)
+        level_sum_down_[0] += -imu.accel_[0];
+        level_sum_down_[1] += imu.accel_[1];
+        level_sum_down_[2] += imu.accel_[2];
+        for (int i = 0; i < SENSOR_NUM; ++i)
+            level_sum_p_[i] += pressure_no_level_[i];
+        ++level_cal_frames_;
+    }
+
+    if (HAL_GetTick() - level_cal_start_ms_ < kLevelCalMs)
+        return;
+
+    level_cal_active_ = false;
+    if (level_cal_frames_ < 50 || level_cal_bad_frames_ * 5 > level_cal_frames_)
+    {
+        Event_PostText(EV_WARN_LEVEL_FAIL, 3, "INVALID");
+        return;
+    }
+
+    const double n = static_cast<double>(level_cal_frames_);
+    const float dx = static_cast<float>(level_sum_down_[0] / n);
+    const float dy = static_cast<float>(level_sum_down_[1] / n);
+    const float dz = static_cast<float>(level_sum_down_[2] / n);
+    const float g = sqrtf(dx * dx + dy * dy + dz * dz);
+    const float pitch = -asinf(dx / g);
+    const float roll = atan2f(dy, dz);
+
+    float p[SENSOR_NUM];
+    float mean = 0.0f;
+    for (int i = 0; i < SENSOR_NUM; ++i)
+    {
+        p[i] = static_cast<float>(level_sum_p_[i] / n);
+        mean += p[i];
+    }
+    mean /= SENSOR_NUM;
+
+    // 偏置 = 实测各路相对平均值的偏差 - 按加速度计姿态应有的偏差（与 ESKF CorrectPressure 同一公式）
+    float offset[SENSOR_NUM];
+    for (int i = 0; i < SENSOR_NUM; ++i)
+    {
+        const float expected = (-kLevelX[i] * sinf(pitch) + kLevelY[i] * cosf(pitch) * sinf(roll)) * kMbarPerMeter;
+        offset[i] = (p[i] - mean) - expected;
+        if (!isfinite(offset[i]) || fabsf(offset[i]) > kLevelMaxAbsMbar)
+        {
+            Event_PostText(EV_WARN_LEVEL_FAIL, 5, "RANGE");
+            return;
+        }
+    }
+    CenterOffsets(offset);
+    for (int i = 0; i < SENSOR_NUM; ++i)
+    {
+        level_offset_mbar[i] = offset[i];
+        Event_PostText(EV_INFO_LEVEL_RESULT, static_cast<int32_t>(lroundf(offset[i] * 1000.0f)), kChannelText[i]);
+    }
+    if (!LevelSave(true))
+    {
+        Event_PostText(EV_WARN_LEVEL_FAIL, 6, "FLASH"); // 本次运行仍然生效，只是断电后丢失
+        return;
+    }
+    Event_PostText(EV_INFO_LEVEL_DONE, 1, "SAVE");
 }

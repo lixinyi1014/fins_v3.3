@@ -35,25 +35,25 @@ void ist8310_com_init(void)
 uint8_t ist8310_IIC_read_single_reg(uint8_t reg)
 {
     uint8_t res;
-    HAL_I2C_Mem_Read(&hi2c3, IST8310_IIC_ADDRESS, reg, I2C_MEMADD_SIZE_8BIT, &res, 1, 100);
+    HAL_I2C_Mem_Read(&hi2c3, IST8310_IIC_ADDRESS, reg, I2C_MEMADD_SIZE_8BIT, &res, 1, 5);
     return res;
 }
 void ist8310_IIC_write_single_reg(uint8_t reg, uint8_t data)
 {
-    HAL_I2C_Mem_Write(&hi2c3, IST8310_IIC_ADDRESS, reg, I2C_MEMADD_SIZE_8BIT, &data, 1, 100);
+    HAL_I2C_Mem_Write(&hi2c3, IST8310_IIC_ADDRESS, reg, I2C_MEMADD_SIZE_8BIT, &data, 1, 5);
 
 }
 void ist8310_IIC_read_muli_reg(uint8_t reg, uint8_t *buf, uint8_t len)
 {
-    HAL_I2C_Mem_Read(&hi2c3, IST8310_IIC_ADDRESS, reg, I2C_MEMADD_SIZE_8BIT, buf, len, 100);
+    HAL_I2C_Mem_Read(&hi2c3, IST8310_IIC_ADDRESS, reg, I2C_MEMADD_SIZE_8BIT, buf, len, 5);
 }
 uint8_t ist8310_IIC_read_muli_reg_status(uint8_t reg, uint8_t *buf, uint8_t len)
 {
-    return HAL_I2C_Mem_Read(&hi2c3, IST8310_IIC_ADDRESS, reg, I2C_MEMADD_SIZE_8BIT, buf, len, 100) == HAL_OK ? 0 : 1;
+    return HAL_I2C_Mem_Read(&hi2c3, IST8310_IIC_ADDRESS, reg, I2C_MEMADD_SIZE_8BIT, buf, len, 5) == HAL_OK ? 0 : 1;
 }
 void ist8310_IIC_write_muli_reg(uint8_t reg, uint8_t *data, uint8_t len)
 {
-    HAL_I2C_Mem_Write(&hi2c3, IST8310_IIC_ADDRESS, reg, I2C_MEMADD_SIZE_8BIT, data, len, 100);
+    HAL_I2C_Mem_Write(&hi2c3, IST8310_IIC_ADDRESS, reg, I2C_MEMADD_SIZE_8BIT, data, len, 5);
 }
 void ist8310_delay_ms(uint16_t ms)
 {

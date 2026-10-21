@@ -58,6 +58,50 @@ class ParserTest(unittest.TestCase):
         self.assertAlmostEqual(item.values["target_roll_rate"], -9.0)
         self.assertAlmostEqual(item.values["target_depth"], 125.0)
         self.assertNotEqual(item.values["u_yaw"], item.values["u_yaw"])   # NaN
+        self.assertNotIn("pres0", item.values)                            # 旧固件 16 项照样能用
+
+    def test_plot_line_with_sensors(self):
+        base = "PL,35,150,-250,4500,4500,-965,20,-30,-900,10,0,1230,1250,400,-80,35,0"
+        item = fins_protocol.parse_line(make_line(base + ",164,-5,30,12,300,-400,-981"), 1.0)
+        self.assertAlmostEqual(item.values["pres0"], 16.4)
+        self.assertAlmostEqual(item.values["pres3"], 1.2)
+        self.assertAlmostEqual(item.values["accel_z"], -9.81)
+        self.assertAlmostEqual(item.values["accel_norm"], (3 ** 2 + 4 ** 2 + 9.81 ** 2) ** 0.5)
+
+    def test_status_feedback_field(self):
+        base = "ST,1000,5,1,0,0,300,295,10,-20,4500,1,0,1550,1600,1550,1550,1550,1550,1550,1550,15"
+        old = fins_protocol.parse_line(make_line(base), 1.0)
+        new = fins_protocol.parse_line(make_line(base + ",1"), 1.0)
+        self.assertEqual(old.feedback_eskf, -1)
+        self.assertEqual(new.feedback_eskf, 1)
+        self.assertEqual(new.pressure_mask, 15)
+
+    def test_csv_recorder(self):
+        import csv, tempfile
+        from pathlib import Path
+        import fins_csv
+        with tempfile.TemporaryDirectory() as d:
+            rec = fins_csv.TelemetryCsv(Path(d) / "log_csv")
+            status = fins_protocol.parse_line(make_line(
+                "ST,1000,5,1,0,0,300,295,10,-20,4500,1,0,1550,1600,1550,1550,1550,1550,1550,1550,15,0"), 1.0)
+            rec.on_plot(fins_protocol.parse_line(make_line("PL,990," + ",".join(["10"] * 16)), 1.0), 1)
+            rec.on_status(status)
+            rec.on_plot(fins_protocol.parse_line(make_line("PL,1020," + ",".join(["10"] * 25)), 1.1), 1)
+            rec.close()
+            rows = list(csv.DictReader(rec.path.open(encoding="utf-8-sig")))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["mode"], "")
+        self.assertEqual(rows[1]["pwm1"], "1600")
+        self.assertEqual(rows[1]["feedback_eskf"], "0")
+        self.assertEqual(rows[1]["vin"], "0.1")
+        self.assertIn("pid_pitch_i", rows[1])
+
+    def test_pid_line(self):
+        item = fins_protocol.parse_line(make_line("PD,1234,105,-20,3,40,60,-5,-30,-120,90,0,-999999"), 1.0)
+        self.assertIsInstance(item, fins_protocol.PidSample)
+        self.assertAlmostEqual(item.values["pid_depth_p"], 10.5)
+        self.assertAlmostEqual(item.values["pid_pitch_p"], -12.0)
+        self.assertNotEqual(item.values["pid_pitch_rate"], item.values["pid_pitch_rate"])   # NaN
 
     def test_garbage_prefix(self):
         line = "\x00\xffgarbage" + make_line("ST,10,0")
@@ -169,6 +213,19 @@ class FirmwareHarnessTest(unittest.TestCase):
                 tracker.handle_line(line, 2.0 + rounds)
         self.assertGreater(tracker.checksum_errors, 0, "测试应当真的丢了数据")
         self.assertEqual(sorted(tracker.current.events), list(range(1, 61)))
+
+    def test_late_connect_after_log_wrapped(self):
+        # 下位机已记了 300 条事件（环形缓冲只留 128 条）后上位机才请求从第 1 条补发：
+        # 原来"先算最早序号再记 211"会让发送循环空转，一条事件也发不出来
+        posts = "".join(f"POST 221 {i}\n" for i in range(300))
+        out = self.run_harness(posts + "STEP 200\nEVQ 1\nPOST 303 8\nSTEP 200\nQUIT\n")
+        tracker = EventTracker()
+        for line in fins_protocol.LineSplitter().feed(out):
+            tracker.handle_line(line, 1.0)
+        session = tracker.current
+        self.assertGreater(len(session.events), 100)
+        self.assertIn(303, [e.code for e in session.events.values()])
+        self.assertEqual(session.missing(), [])
 
     def test_fatal_loop(self):
         out = self.run_harness("POST 301 8\nPOST 302 300\nSTEP 5\nFATAL\n", kill_after_ft=2)

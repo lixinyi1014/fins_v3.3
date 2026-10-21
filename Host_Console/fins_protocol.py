@@ -6,7 +6,8 @@
     $EV,<seq>,<t_ms>,<code>,<arg>,<text>*HH     事件，seq 上电从 1 递增
     $ST,<t_ms>,<last_seq>,<19 个状态字段>*HH      状态，约 10 Hz
     $FT,<t_ms>,<seq>,<code>*HH                   致命，单片机已停住，约每 0.5 s 重复
-    $PL,<t_ms>,<16 个曲线字段>*HH                  画图用，约 30 Hz
+    $PL,<t_ms>,<25 个曲线字段>*HH                  画图用，约 30 Hz（旧固件 16 / 23 个）
+    $PD,<t_ms>,<11 个 PID 分解字段 ×10 us>*HH     约 30 Hz，与 $PL 错开
 上位机命令以换行结尾：
     HB          心跳（100 ms 一次）
     EVQ:<seq>   请求从 seq 开始补发事件
@@ -21,6 +22,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 
@@ -103,6 +105,7 @@ class Status:
     pwm: list[int]
     pressure_mask: int
     pc_time: float
+    feedback_eskf: int = -1      # 闭环反馈来源：0 水压差，1 ESKF，-1 旧固件没有这一项
 
     @property
     def active(self) -> bool:
@@ -116,11 +119,29 @@ PLOT_FIELDS = [
     ("target_roll_rate", 0.01), ("target_pitch_rate", 0.01), ("target_yaw_rate", 0.01),
     ("depth", 0.1), ("target_depth", 0.1),                                         # mbar
     ("u_depth", 0.1), ("u_roll", 0.1), ("u_pitch", 0.1), ("u_yaw", 0.1),           # us
+    # 2026-10-13 起追加（旧固件没有这几项，照样能解析前 16 项）
+    ("pres0", 0.1), ("pres1", 0.1), ("pres2", 0.1), ("pres3", 0.1),                # 水压计去零偏 mbar：左前 左后 右后 右前
+    ("accel_x", 0.01), ("accel_y", 0.01), ("accel_z", 0.01),                       # 加计 FRD m/s²
+    ("vin", 0.01), ("vdda", 0.001),                                                # 输入电压 V、单片机 3.3 V
 ]
+PLOT_FIELDS_MIN = 16
 
 
 @dataclass
 class PlotSample:
+    t_ms: int
+    values: dict[str, float]
+    pc_time: float
+
+
+# $PD 字段：控制量拆成各项贡献（us，×10 传输）。横滚/俯仰 = 内环kp×外环P/I/D + 内环角速度阻尼
+PID_FIELDS = ["pid_depth_p", "pid_depth_i", "pid_depth_d",
+              "pid_roll_p", "pid_roll_i", "pid_roll_d", "pid_roll_rate",
+              "pid_pitch_p", "pid_pitch_i", "pid_pitch_d", "pid_pitch_rate"]
+
+
+@dataclass
+class PidSample:
     t_ms: int
     values: dict[str, float]
     pc_time: float
@@ -135,7 +156,7 @@ class Fatal:
 
 
 def parse_line(line: str, pc_time: float | None = None):
-    """返回 Event / Status / Fatal / PlotSample，无法识别返回 None。"""
+    """返回 Event / Status / Fatal / PlotSample / PidSample，无法识别返回 None。"""
     fields = split_checked(line)
     if not fields:
         return None
@@ -153,13 +174,21 @@ def parse_line(line: str, pc_time: float | None = None):
             t_ms, last_seq, mode, stop, silent, tgt, depth, roll, pitch, yaw, src, motion = values[:12]
             pwm = values[12:20]
             mask = values[20]
+            feedback = values[21] if len(values) > 21 else -1
             return Status(t_ms, last_seq, mode, stop, silent, tgt, depth, roll, pitch, yaw,
-                          bool(src), motion, pwm, mask, now)
-        if kind == "PL" and len(fields) >= 2 + len(PLOT_FIELDS):
+                          bool(src), motion, pwm, mask, now, feedback)
+        if kind == "PL" and len(fields) >= 2 + PLOT_FIELDS_MIN:
             raw = [int(x) for x in fields[2:2 + len(PLOT_FIELDS)]]
             values = {name: (v * scale if v != -999999 else float("nan"))
                       for (name, scale), v in zip(PLOT_FIELDS, raw)}
+            if all(k in values for k in ("accel_x", "accel_y", "accel_z")):
+                values["accel_norm"] = math.sqrt(values["accel_x"] ** 2 + values["accel_y"] ** 2 +
+                                                 values["accel_z"] ** 2)
             return PlotSample(int(fields[1]), values, now)
+        if kind == "PD" and len(fields) >= 2 + len(PID_FIELDS):
+            raw = [int(x) for x in fields[2:2 + len(PID_FIELDS)]]
+            values = {name: (v * 0.1 if v != -999999 else float("nan")) for name, v in zip(PID_FIELDS, raw)}
+            return PidSample(int(fields[1]), values, now)
         if kind == "FT" and len(fields) >= 4:
             return Fatal(int(fields[1]), int(fields[2]), int(fields[3]), now)
     except ValueError:

@@ -22,6 +22,13 @@ namespace
     Device **device_list = nullptr;
     // 保存设备数量。
     uint32_t device_count = 0;
+    // 设备名（只用 ASCII，上报"某模块卡住"用），可为空
+    const char *const *device_names = nullptr;
+    // 单个模块 Handle() 超过这个时间就上报 218（正常整个周期 < 6.7 ms）
+    constexpr uint32_t kSlowHandleMs = 20;
+    uint32_t last_slow_report_ms = 0;
+    // 模块预先声明"这一步会很久"（水压标定约 2.4 s），本周期不报 218
+    volatile bool expect_long_step = false;
 
     /*
      * FreeRTOS 任务句柄。
@@ -69,7 +76,7 @@ namespace
     const char *const kKnownCommands[] = {
         "ON", "OFF", "UP", "DN", "W", "A", "S", "D", "Q", "E", "Z",
         "H:", "RPY:", "ACL:", "ANG:", "TES:", "MOT:", "CA", "VA",
-        "BEG", "END", "IVA:", "HB", "EVQ:"};
+        "BEG", "END", "IVA:", "HB", "EVQ:", "FB:", "LVL"};
 
     bool IsKnownCommand(const char *line, size_t length)
     {
@@ -205,9 +212,25 @@ namespace
              * 这部分就是原来 Usermain.cpp 中
              * while(1) 里面的设备循环。
              */
+            // 串口接收若意外停了（重开失败等），这里补开，否则心跳会断
+            Uart6_EnsureReceiving();
+
             for (uint32_t i = 0; i < device_count; ++i)
             {
+                const uint32_t start_ms = HAL_GetTick();
                 device_list[i]->Handle();
+                const uint32_t used_ms = HAL_GetTick() - start_ms;
+                // 某个模块把控制任务卡住（I2C 等待等）：卡住期间遥测、心跳检查、停机都不执行，事后补报是谁、多久
+                if (expect_long_step)
+                {
+                    expect_long_step = false;
+                }
+                else if (used_ms >= kSlowHandleMs && HAL_GetTick() - last_slow_report_ms >= 1000U)
+                {
+                    last_slow_report_ms = HAL_GetTick();
+                    Event_PostText(EV_WARN_LOOP_OVERRUN, static_cast<int32_t>(used_ms),
+                                   device_names ? device_names[i] : "?");
+                }
             }
             /*
  * 所有设备完成本次 Handle() 后，
@@ -323,8 +346,14 @@ extern "C" void vApplicationGetIdleTaskMemory(
 /*
  * 在 main() 中调用这个函数创建任务。
  */
-void StartControllerTask(Device *devices[], uint32_t count)
+void Controller_ExpectLongStep(void)
 {
+    expect_long_step = true;
+}
+
+void StartControllerTask(Device *devices[], uint32_t count, const char *const *names)
+{
+    device_names = names;
     /*
      * 保存设备数组地址和设备数量。
      * 这些值在启动调度器前设置好，之后不会改变。

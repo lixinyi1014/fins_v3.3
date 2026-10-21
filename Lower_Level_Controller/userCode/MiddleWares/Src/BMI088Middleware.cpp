@@ -21,11 +21,14 @@ void BMI088_delay_ms(uint16_t ms)
 
 void BMI088_delay_us(uint16_t us)
 {
-    uint16_t i;
-    for (i = 0; i < us; i++ )
+    // 原来是 int a = 10; while (a--); —— 编译器开优化后整段删掉，等于完全不延时，
+    // BMI088 写寄存器后的等待全部失效。加 volatile 保留循环：168 MHz 下内层约 6 周期/次，30 次约 1 us（只会偏长）。
+    for (uint16_t i = 0; i < us; i++)
     {
-        int a = 10;  //delay based on mian clock, 168Mhz
-        while (a-- );
+        volatile int a = 30;
+        while (a--)
+        {
+        }
     }
 }
 

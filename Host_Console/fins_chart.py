@@ -1,6 +1,6 @@
 """实时曲线（纯 tkinter Canvas，不依赖 matplotlib）。
 
-* 每种单位一个小图（姿态角 °、角速度 °/s、深度 mbar、控制量 us、推进器 PWM us），绝不把两种单位画在同一根 y 轴上。
+* 每种单位一个小图（姿态角 °、角速度 °/s、深度 mbar、控制量 us、推进器 PWM us、水压计 mbar、加速度 m/s²），绝不把两种单位画在同一根 y 轴上。
 * 每个轴向固定一个颜色（横滚蓝、俯仰橙、偏航青、深度黄），实际值实线、目标值同色虚线，跨图一致。
 * "曲线"菜单勾选要显示的量，也有常用组合；鼠标移到图上显示十字线和该时刻的数值。
 * 时间轴用下位机板上时间，丢行不会把曲线拉歪；下位机重启自动清空。
@@ -19,7 +19,9 @@ BLUE, ORANGE, AQUA, YELLOW, MAGENTA, GREEN, VIOLET, RED = (
 TEXT, MUTED, GRID, AXIS, BORDER, CROSS = "#1F2328", "#6B7280", "#EEF0F2", "#C7CCD1", "#E3E6EA", "#9CA3AF"
 
 GROUPS = [("angle", "姿态角", "°"), ("rate", "角速度", "°/s"), ("depth", "深度", "mbar"),
-          ("control", "控制量", "us"), ("pwm", "推进器 PWM", "us")]
+          ("control", "控制量", "us"), ("pwm", "推进器 PWM", "us"),
+          ("pressure", "水压计", "mbar"), ("accel", "加速度计", "m/s²"),
+          ("vin", "输入电压", "V"), ("vdda", "单片机电源", "V")]
 
 # (键, 组, 名称, 颜色, 虚线=目标值, 小数位)
 SERIES = [
@@ -40,7 +42,18 @@ SERIES = [
     ("u_pitch", "control", "俯仰", ORANGE, False, 0),
     ("u_yaw", "control", "偏航", AQUA, False, 0),
 ] + [(f"pwm{i}", "pwm", f"{i}号", c, False, 0)
-     for i, c in enumerate((BLUE, ORANGE, AQUA, YELLOW, MAGENTA, GREEN, VIOLET, RED))]
+     for i, c in enumerate((BLUE, ORANGE, AQUA, YELLOW, MAGENTA, GREEN, VIOLET, RED))] + [
+    ("pres0", "pressure", "0 左前", BLUE, False, 1),
+    ("pres1", "pressure", "1 左后", ORANGE, False, 1),
+    ("pres2", "pressure", "2 右后", GREEN, False, 1),
+    ("pres3", "pressure", "3 右前", VIOLET, False, 1),
+    ("accel_x", "accel", "X 前", BLUE, False, 2),
+    ("accel_y", "accel", "Y 右", ORANGE, False, 2),
+    ("accel_z", "accel", "Z 下", AQUA, False, 2),
+    ("accel_norm", "accel", "模长 |a|", RED, False, 2),
+    ("vin", "vin", "输入电压", RED, False, 2),
+    ("vdda", "vdda", "3.3 V", VIOLET, False, 3),
+]
 SERIES_BY_KEY = {s[0]: s for s in SERIES}
 
 PRESETS = [
@@ -49,6 +62,8 @@ PRESETS = [
     ("偏航调参", ["yaw", "target_yaw", "yaw_rate", "target_yaw_rate", "u_yaw"]),
     ("深度调参", ["depth", "target_depth", "u_depth"]),
     ("推进器 PWM", [f"pwm{i}" for i in range(8)]),
+    ("传感器：水压计 + 加速度计", ["pres0", "pres1", "pres2", "pres3", "accel_x", "accel_y", "accel_z", "accel_norm"]),
+    ("供电排查：电压 + 控制量", ["vin", "vdda", "u_depth", "u_roll", "u_pitch", "u_yaw"]),
 ]
 DEFAULT_SELECTION = ["roll", "pitch", "roll_rate", "target_roll_rate", "pitch_rate", "target_pitch_rate",
                      "depth", "target_depth"]

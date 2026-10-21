@@ -16,10 +16,15 @@ namespace
 Propeller_I2C *g_propeller = nullptr;
 int StatusFieldsThunk(char *buf, int size) { return g_propeller ? g_propeller->FormatStatusFields(buf, size) : 0; }
 int PlotFieldsThunk(char *buf, int size) { return g_propeller ? g_propeller->FormatPlotFields(buf, size) : 0; }
+int PidFieldsThunk(char *buf, int size) { return g_propeller ? g_propeller->FormatPidFields(buf, size) : 0; }
 void FatalNeutralThunk() { if (g_propeller) g_propeller->FatalNeutral(); }
 // 水压计相对舱体中心的位置（与 AttitudeEskf::CorrectPressure 相同，V3.3 设计图/STEP）
 constexpr float kSensorHalfX_m = 0.1247f;
 constexpr float kSensorHalfY_m = 0.0691f;
+// 积分暂停：目标深度在变、水平运动中，以及之后 0.8 s，深度和俯仰外环都不积分；深度误差超过 6 mbar 也不积分。
+// 这些时候的误差是暂时的（拖缆、推力线不过重心），积进去松手后会过冲。6 mbar 时 P 已有 60 us，够顶住悬停所需
+constexpr uint32_t kIntegralHoldAfter_ms = 800;
+constexpr float kDepthIntegralBand_mbar = 6.0f;
 }
 
 // V33
@@ -28,20 +33,25 @@ std::array<uint8_t, 4> InID = {1, 2, 6, 5};                // V33-1,2 Channel in
 std::array<uint8_t, 4> OutID = {0, 3, 7, 4};               // V33-1,2 Channel indices on the expansion board for the four external thrusters: front-left, rear-left, front-right, rear-right. //外部的4个推进器接到扩展板上的序号，左前-左后-右前-右后
 int32_t InitPWM = 1550; // Initial PWM value for thruster initialization. // 推进器初始化的PWM（V33-0,1）
 //int32_t InitPWM = 1540; // Initial PWM value for thruster initialization. //推进器初始化的PWM（V33-2）
-std::array<int32_t, 8> Compensation = {50, 50, 50, 50, 50, 50, 50, 50}; // Dead-zone compensation value. // 死区补偿值
+// 死区补偿：控制量离开中位时直接跳过电调死区。2026-10-19 水中实测（ch1）：PWM ≥1605 开始正转、≤1490 开始反转，
+// 死区 1490～1605 相对中位 1550 不对称（-60 / +55）。原来两边都补 50，两侧各有 5～10 us 落在死区里没推力，
+// 控制量过零时推进器在"不转"和"突然出力"之间来回跳，前面两个垂直推进器约 1 Hz 抖动就是这个
+std::array<int32_t, 8> Compensation = {55, 55, 55, 55, 55, 55, 55, 55};       // PWM 高于中位时加：1605 - 1550
+std::array<int32_t, 8> CompensationDown = {60, 60, 60, 60, 60, 60, 60, 60};   // PWM 低于中位时减：1550 - 1490
 // Vertical thrusters.
 // 垂直推进器
 std::array<int32_t, 4> FloatPWM = {
     InitPWM,
-    InitPWM - Sign[InID[1]] * 100,
+    InitPWM - Sign[InID[1]] * 50,
     InitPWM,
-    InitPWM - Sign[InID[3]] * 90
+    InitPWM - Sign[InID[3]] * 45
 };
 // Horizontal thrusters.
 // 水平推进器
-uint8_t longitudinal_speed = 80;
-uint8_t lateral_speed = 80;
-uint8_t rotate_speed = 40;
+// 2026-10-20 遥控速度全部减半（原 80 / 80 / 40）：拖缆时推力线不过重心造成的俯仰、深度干扰和电池压降都小一半
+uint8_t longitudinal_speed = 60;   // 2026-10-21 前后 40→60（向前走不动）；左右、旋转不变
+uint8_t lateral_speed = 40;
+uint8_t rotate_speed = 20;
 std::array<int32_t, 4> StopPWM = {InitPWM, InitPWM, InitPWM, InitPWM};
 std::array<int32_t, 4> FrontPWM = {
     InitPWM - Sign[OutID[0]] * longitudinal_speed,
@@ -86,10 +96,10 @@ PID_Regulator_t RollPID(1.8, 0.02, 100, 50, 25, 25, 100);
 PID_Regulator_t YawPID(12, 0.06, 300, 10, 100, 50, 300);
 PID_Regulator_t YawInPID(5, 0, 0, 200, 100, 100, 400);
 PID_Regulator_t YawOutPID(2, 0.01, 2, 10, 5, 5, 20);
-PID_Regulator_t RollInPID(8, 0, 0, 100, 50, 50, 200);
-PID_Regulator_t RollOutPID(0.5, 0.002, 1, 5, 2.5, 2.5, 10);
-PID_Regulator_t PitchInPID(8, 0, 0, 100, 50, 50, 200);
-PID_Regulator_t PitchOutPID(1, 0.005, 1, 5, 2.5, 2.5, 10);
+PID_Regulator_t RollInPID(30, 0, 0, 100, 50, 50, 200); 
+PID_Regulator_t RollOutPID(0.2, 0.002, 0.06, 1.0, 0.5, 0.5, 10); 
+PID_Regulator_t PitchInPID(40, 0, 0, 100, 50, 50, 200);
+PID_Regulator_t PitchOutPID(0.22, 0.002, 0.06, 1.4, 1.2, 0.5, 10); 
 // IMU
 // PID_Regulator_t PitchInPID(2, 0, 40, 100, 50, 50, 200);
 // PID_Regulator_t PitchOutPID(7, 0.5, 100, 5, 2.5, 2.5, 10);
@@ -162,6 +172,7 @@ void Propeller_I2C::Init()
     g_propeller = this;
     Telemetry_SetStatusSource(StatusFieldsThunk);
     Telemetry_SetPlotSource(PlotFieldsThunk);
+    Telemetry_SetPidSource(PidFieldsThunk);
     Fins_SetFatalNeutral(FatalNeutralThunk);
 
     TCA_SetChannel(4);  // Expand a single I2C bus into eight channels. // 1路 I2C 扩展为 8路
@@ -184,12 +195,25 @@ void Propeller_I2C::Receive()
     int32_t data_receive[8];
     (void)data_receive;
     // RxBuffer 由控制任务按行拆好、以 0 结尾
-    const size_t rx_length = strnlen((char *)RxBuffer, SERIAL_LENGTH_MAX);
-
+    size_t rx_length = 0;
+    while (rx_length < SERIAL_LENGTH_MAX && RxBuffer[rx_length] != '\0')
+        ++rx_length;  
     // OFF 在任何模式下都生效（原来只在深度闭环开启时才处理，TES 手动输出关不掉）
     if (rx_length == 3 && strncmp((char *)RxBuffer, "OFF", 3) == 0)
     {
         Stop(EV_STOP_USER_OFF, 0);
+        return;
+    }
+
+    // 反馈来源开关：任何模式下都可切换。切换时清掉横滚/俯仰外环，避免两种反馈的微小差异让积分跳变
+    const bool fb_prs = rx_length == 6 && strncmp((char *)RxBuffer, "FB:PRS", 6) == 0;
+    const bool fb_eskf = rx_length == 7 && strncmp((char *)RxBuffer, "FB:ESKF", 7) == 0;
+    if (fb_prs || fb_eskf)
+    {
+        feedback_fusion_ = fb_eskf;
+        RollOutPID.Reset();
+        PitchOutPID.Reset();
+        Event_Post(EV_INFO_FEEDBACK_SOURCE, feedback_fusion_ ? 1 : 0);
         return;
     }
 
@@ -332,7 +356,8 @@ void Propeller_I2C::Receive()
             {
                 current_PWM[i] = Parameter.InitPWM;
             }
-            Target_depth = (PressureSensor::pressure_sensor.data_depth - 1.0 > 30.0) ? (PressureSensor::pressure_sensor.data_depth - 1.0) : 30.0;
+            // ON 时的目标深度（与原版仓库相同）：已经比 30 mbar（约 30 cm）深就保持当前深度（减 1 mbar），否则下潜到 30 mbar
+            Target_depth = (PressureSensor::pressure_sensor.data_depth - 1.0 > 30.0) ? (PressureSensor::pressure_sensor.data_depth - 1.0) : 30.0; // 与原版仓库相同
             stop_code_ = 0;
             nan_vertical_streak_ = nan_horizontal_streak_ = 0;
             Event_Post(EV_INFO_ARMED, static_cast<int32_t>(Target_depth * 10.0f));
@@ -342,13 +367,15 @@ void Propeller_I2C::Receive()
 
 void Propeller_I2C::Handle()
 {
-    // 心跳：推进器在出力时，连续 100 个周期（约 0.67 s）没收到上位机任何数据就停机
+    //推进器在出力时，连续 100 个周期（约 0.67 s）没收到上位机任何数据就停机
     const uint32_t silent = CommandSilentCycles();
     if (IsActive() && silent >= kFailLimit)
     {
         Stop(EV_STOP_HEARTBEAT, static_cast<int32_t>(silent));
     }
 
+    Power_Sample(IsActive()); // 供电监测（输入电压、单片机 3.3 V），跌落时报 221
+    I2C2_RecoverIfStuck(); // 水压计之后总线若卡住，写推进器前先复位
     const bool tca_ok = TCA_SetChannel(4) == ExtensionResult::Ok;
     // HAL_Delay(5);
     vertical_PWM_allocation();
@@ -466,7 +493,14 @@ int Propeller_I2C::FormatPlotFields(char *buf, int size)
     constexpr float kCentiDegree = 18000.0f / PI; // rad -> 0.01 度
     const float depth = PressureSensor::pressure_sensor.data_depth;
     const float u_yaw = flag_angle ? PWM_component.Yaw : 0.0f;
-    return snprintf(buf, size, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+    /*
+     * 传感器原始读数（排查用）：
+     * 四路水压计去零偏后的值（0 左前、1 左后、2 右后、3 右前），×10 mbar；
+     * 加计（已减零偏）换到 FRD 机体系 = diag(1,-1,-1)×IMU，×100 m/s²。静止水平时约 (0, 0, -9.8)，抬头 X 变正、右倾 Y 变负。
+     */
+    const float *p = PressureSensor::pressure_sensor.data_pressure;
+    const float *a = IMU::imu.pro_data.accel;
+    return snprintf(buf, size, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
                     scaled(roll, kCentiDegree), scaled(pitch, kCentiDegree), scaled(yaw, kCentiDegree),
                     scaled(-Target_yaw, kCentiDegree),
                     scaled(-IMU::imu.attitude.neg_roll_v, kCentiDegree),
@@ -476,7 +510,38 @@ int Propeller_I2C::FormatPlotFields(char *buf, int size)
                     scaled(-Target_yaw_v, kCentiDegree),
                     scaled(depth, 10.0f), scaled(Target_depth, 10.0f),
                     scaled(PWM_component.Depth, 10.0f), scaled(PWM_component.Roll, 10.0f),
-                    scaled(PWM_component.Pitch, 10.0f), scaled(u_yaw, 10.0f));
+                    scaled(PWM_component.Pitch, 10.0f), scaled(u_yaw, 10.0f),
+                    scaled(p[0], 10.0f), scaled(p[1], 10.0f), scaled(p[2], 10.0f), scaled(p[3], 10.0f),
+                    scaled(a[0], 100.0f), scaled(-a[1], 100.0f), scaled(-a[2], 100.0f),
+                    scaled(Power_Vin(), 100.0f), scaled(Power_Vdda(), 1000.0f));   // 输入电压 ×100 V，单片机 3.3 V ×1000
+}
+
+int Propeller_I2C::FormatPidFields(char *buf, int size)
+{
+    /*
+     * 把控制量拆成各项的贡献（单位 us，和 $PL 里的深度/横滚/俯仰控制量同号、可以直接相加）：
+     *   深度控制量 = P + I + D（DepthPID 本身的三项）
+     *   横滚/俯仰控制量 = 内环kp × (外环P + 外环I + 外环D) + 内环kp × (-角速度反馈)
+     * 最后一项就是内环的角速度阻尼。外环输出的三项已是各自限幅后的值；内环限幅（P 上限 100、总输出 200）只在打满时才让总和对不上。
+     * 外环 50 Hz 更新，内环 150 Hz；这里取发送时刻的值。闭环没开时全为 0。
+     */
+    if (!flag_float)
+        return snprintf(buf, size, "0,0,0,0,0,0,0,0,0,0,0");
+    auto us10 = [](float v) -> int {
+        const float x = v * 10.0f;
+        return isfinite(x) ? static_cast<int>(x) : -999999;
+    };
+    const PID_Regulator_t &d = DepthPID.PIDInfo;
+    const PID_Regulator_t &ro = RollOutPID.PIDInfo;
+    const PID_Regulator_t &po = PitchOutPID.PIDInfo;
+    const float kr = RollInPID.PIDInfo.kp;
+    const float kp = PitchInPID.PIDInfo.kp;
+    return snprintf(buf, size, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
+                    us10(d.componentKp), us10(d.componentKi), us10(d.componentKd),
+                    us10(kr * ro.componentKp), us10(kr * ro.componentKi), us10(kr * ro.componentKd),
+                    us10(-kr * RollInPID.PIDInfo.fdb),
+                    us10(kp * po.componentKp), us10(kp * po.componentKi), us10(kp * po.componentKd),
+                    us10(-kp * PitchInPID.PIDInfo.fdb));
 }
 
 void Propeller_I2C::FatalNeutral()
@@ -517,7 +582,7 @@ int Propeller_I2C::FormatStatusFields(char *buf, int size)
     };
     const int mode = flag_float ? (flag_angle ? 2 : 1) : (IsActive() ? 3 : 0);
     const float depth = PressureSensor::pressure_sensor.data_depth;
-    return snprintf(buf, size, "%d,%u,%lu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u",
+    return snprintf(buf, size, "%d,%u,%lu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%u,%d",
                     mode, static_cast<unsigned>(stop_code_), static_cast<unsigned long>(CommandSilentCycles()),
                     static_cast<int>(Target_depth * 10.0f), isfinite(depth) ? static_cast<int>(depth * 10.0f) : -99999,
                     centi_degree(roll), centi_degree(pitch), centi_degree(yaw), source,
@@ -526,7 +591,8 @@ int Propeller_I2C::FormatStatusFields(char *buf, int size)
                     static_cast<int>(current_PWM[2]), static_cast<int>(current_PWM[3]),
                     static_cast<int>(current_PWM[4]), static_cast<int>(current_PWM[5]),
                     static_cast<int>(current_PWM[6]), static_cast<int>(current_PWM[7]),
-                    static_cast<unsigned>(PressureSensor::pressure_sensor.ValidMask()));
+                    static_cast<unsigned>(PressureSensor::pressure_sensor.ValidMask()),
+                    feedback_fusion_ ? 1 : 0); // 最后一项：闭环反馈来源 0=水压差 1=ESKF
 }
 
 void Propeller_I2C::float_ctrl()
@@ -542,11 +608,30 @@ void Propeller_I2C::float_ctrl()
         float roll_feedback_mbar = PressureSensor::pressure_sensor.data_roll;
         float pitch_feedback_mbar = PressureSensor::pressure_sensor.data_pitch;
 
-        if (fusion_ready && isfinite(fusion_state.depth_m) && isfinite(fusion_state.euler_rad[1]) && isfinite(fusion_state.euler_rad[2])) {
+        // 默认（FB:PRS）与原版相同用四路水压差；FB:ESKF 时才用融合结果
+        if (feedback_fusion_ && fusion_ready && isfinite(fusion_state.depth_m) && isfinite(fusion_state.euler_rad[1]) && isfinite(fusion_state.euler_rad[2])) {
             depth_feedback_mbar = fusion_state.depth_m / pressure_to_depth_m_per_mbar;
             roll_feedback_mbar = -4.0f * sensor_y_m * sinf(fusion_state.euler_rad[2]) / pressure_to_depth_m_per_mbar;
             pitch_feedback_mbar = -4.0f * sensor_x_m * sinf(fusion_state.euler_rad[1]) / pressure_to_depth_m_per_mbar;
         }
+
+        // 积分暂停条件（见 kIntegralHoldAfter_ms）
+        const uint32_t now_ms = HAL_GetTick();
+        if (Target_depth != last_target_depth_)
+        {
+            last_target_depth_ = Target_depth;
+            target_change_ms_ = now_ms;
+        }
+        if (motion_state != STOP && motion_state != FLOAT)
+        {
+            motion_active_ms_ = now_ms;
+            motion_seen_ = true;
+        }
+        const bool motion_hold = motion_seen_ && now_ms - motion_active_ms_ < kIntegralHoldAfter_ms;
+        const bool target_hold = now_ms - target_change_ms_ < kIntegralHoldAfter_ms;
+        DepthPID.PIDInfo.integralHold = motion_hold || target_hold ||
+                                        !(fabsf(Target_depth - depth_feedback_mbar) <= kDepthIntegralBand_mbar);
+        PitchOutPID.PIDInfo.integralHold = motion_hold;
 
         PWM_component.Depth = DepthPID.PIDCalc(Target_depth, depth_feedback_mbar);
 
@@ -639,10 +724,9 @@ void Propeller_I2C::vertical_PWM_allocation()
             uint8_t idx = Parameter.InID[i];
             int8_t sign = Parameter.Sign[idx];
             int32_t base = Parameter.FloatPWM[i];
-            int32_t comp = Parameter.Compensation[idx];
             int32_t pwm = base - sign * (depth * factors[i][0] + roll * factors[i][1] + pitch * factors[i][2]);
-            if (pwm > Parameter.InitPWM) pwm += comp;
-            else if(pwm < Parameter.InitPWM) pwm -= comp; // Compensate for the motor dead zone. // 补偿电机死区
+            if (pwm > Parameter.InitPWM) pwm += Parameter.Compensation[idx];
+            else if(pwm < Parameter.InitPWM) pwm -= CompensationDown[idx]; // Compensate for the motor dead zone. // 补偿电机死区（两侧不对称）
             current_PWM[idx] = pwm;
         }
     }
@@ -679,10 +763,9 @@ void Propeller_I2C::horizontal_PWM_allocation()
 					uint8_t idx = Parameter.OutID[i];
 					int32_t sign = Parameter.Sign[idx];
 					int32_t base = state_PWM_map[motion_state][i];
-					int32_t comp = Parameter.Compensation[idx];
 					int32_t pwm = base + ((i<2) ? sign : - sign) * yaw;
-					if (pwm > Parameter.InitPWM) pwm += comp;
-					else if(pwm < Parameter.InitPWM) pwm -= comp; // Compensate for the motor dead zone. // 补偿电机死区
+					if (pwm > Parameter.InitPWM) pwm += Parameter.Compensation[idx];
+					else if(pwm < Parameter.InitPWM) pwm -= CompensationDown[idx]; // Compensate for the motor dead zone. // 补偿电机死区（两侧不对称）
 					current_PWM[idx] = pwm;
 			}
 		}
@@ -712,7 +795,7 @@ void Propeller_I2C::command_set_angle_closeloop(){
         {
             FusionState fusion_state = {};
 
-            if (GetFusionState(&fusion_state) &&
+            if (feedback_fusion_ && GetFusionState(&fusion_state) &&
                 isfinite(fusion_state.euler_rad[0]))
             {
                 // 换算到 IMU 方向（见 angle_ctrl），之后反馈也固定用 ESKF

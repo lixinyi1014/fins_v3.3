@@ -25,6 +25,9 @@ try:
 except ImportError:
     pygame = None
 
+# pygame 2（SDL2）支持手柄热插拔事件，手柄列表会自动更新
+HOTPLUG = pygame is not None and hasattr(pygame, "JOYDEVICEADDED")
+
 DEFAULT_MAPPING = {
     "buttons": {"ascend": 0, "descend": 1, "yaw_ccw": 2, "yaw_cw": 3, "yaw_hold_toggle": 4,
                 "estop": 6, "arm_toggle": 7, "servo_left_center": 8, "servo_right_center": 9},
@@ -83,8 +86,14 @@ class Gamepad:
             return
         self._next_scan = now + 1.0
         try:
-            pygame.joystick.quit()
-            pygame.joystick.init()
+            if not HOTPLUG:
+                # 老版 pygame（1.9）不支持热插拔，只能重新初始化手柄模块来重新扫描；
+                # 这种版本也不会产生 JOYDEVICEREMOVED 事件，所以不会自己把自己判成拔出
+                pygame.joystick.quit()
+                pygame.joystick.init()
+            # pygame 2 会通过 JOYDEVICEADDED/REMOVED 事件自动更新手柄列表，直接看数量即可。
+            # 原来这里每秒 quit()+init() 一次：重新初始化会让 SDL 发出"手柄已拔出"事件，
+            # 下一次 poll 收到后把手柄清掉，1 秒后又重新连上——日志里每秒"已连接/已断开"交替就是这个
             if pygame.joystick.get_count() == 0:
                 return
             joystick = pygame.joystick.Joystick(0)
@@ -113,9 +122,18 @@ class Gamepad:
             return state
         try:
             for event in pygame.event.get():
-                if event.type == getattr(pygame, "JOYDEVICEREMOVED", -1):
-                    self._joystick = None
-                    self._log("手柄已断开", "warn")
+                if event.type == getattr(pygame, "JOYDEVICEREMOVED", -1) and self._joystick is not None:
+                    # 只有拔出的正是当前用的这个手柄才算断开（instance_id 对得上）
+                    removed = getattr(event, "instance_id", None)
+                    try:
+                        current = self._joystick.get_instance_id()
+                    except Exception:  # noqa: BLE001  手柄对象已失效
+                        current = removed
+                    if removed is None or removed == current:
+                        self._joystick = None
+                        self._log("手柄已断开", "warn")
+                elif event.type == getattr(pygame, "JOYDEVICEADDED", -1) and self._joystick is None:
+                    self._next_scan = 0.0       # 新插入手柄：下面马上去连，不用等 1 s
         except Exception:  # noqa: BLE001
             pass
         self._acquire(now)

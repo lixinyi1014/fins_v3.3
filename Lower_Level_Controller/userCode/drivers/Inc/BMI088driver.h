@@ -107,6 +107,7 @@ extern uint8_t BMI088_init(void);
 extern uint8_t bmi088_accel_self_test(void);
 extern uint8_t bmi088_gyro_self_test(void);
 extern uint8_t bmi088_accel_init(void);
+extern uint8_t BMI088_accel_sync_sensitivity(void);
 extern uint8_t bmi088_gyro_init(void);
 
 extern void BMI088_accel_read_over(uint8_t *rx_buf, float accel[3], float *time);

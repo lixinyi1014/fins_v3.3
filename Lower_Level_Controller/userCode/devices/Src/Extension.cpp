@@ -2,6 +2,7 @@
 // Created by admin on 2023/10/29.
 //
 #include "Extension.h"
+#include "EventLog.h"
 // This file is used to handle the I2C expansion board (TCA) and the PWM expansion board (PCA).
 // The I2C expansion board is connected to the C-board I2C header (second row from the top, four wires: left—SDA, SCL, VCC, GND—right).
 // The PWM expansion board is connected to port 0 of the I2C expansion board.
@@ -24,6 +25,74 @@ static ExtensionResult ConvertHalStatus(HAL_StatusTypeDef status) {
     return ExtensionResult::I2cError;
 }
 
+namespace
+{
+void BusDelay()
+{
+    volatile int n = 150; // 约 5 us（168 MHz）
+    while (n--)
+    {
+    }
+}
+}
+
+/*
+ * I2C2 总线恢复。STM32F4 的 I2C 在干扰下会出现 BUSY 一直为 1（从机拉住 SDA，或外设状态机卡住），
+ * 之后每次传输都先等 25 ms 再失败。这里：关外设 → 把 PF1(SCL) 手动打 9 个时钟让从机放开 SDA → 发 STOP
+ * → 外设复位 → 重新初始化。只能在两次传输之间调用（控制任务里各设备 Handle 开头）。
+ */
+bool I2C2_RecoverIfStuck(void)
+{
+    const uint32_t sr1 = hi2c2.Instance->SR1;
+    const uint32_t sr2 = hi2c2.Instance->SR2;
+    const bool stuck = (sr2 & I2C_SR2_BUSY) != 0U || (sr1 & (I2C_SR1_BERR | I2C_SR1_ARLO)) != 0U;
+    if (!stuck)
+        return false;
+
+    HAL_I2C_DeInit(&hi2c2);
+    GPIO_InitTypeDef gpio = {};
+    gpio.Pin = GPIO_PIN_0 | GPIO_PIN_1; // PF0 = SDA, PF1 = SCL
+    gpio.Mode = GPIO_MODE_OUTPUT_OD;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_WritePin(GPIOF, GPIO_PIN_0 | GPIO_PIN_1, GPIO_PIN_SET);
+    HAL_GPIO_Init(GPIOF, &gpio);
+    BusDelay();
+    for (int i = 0; i < 9; ++i)
+    {
+        HAL_GPIO_WritePin(GPIOF, GPIO_PIN_1, GPIO_PIN_RESET);
+        BusDelay();
+        HAL_GPIO_WritePin(GPIOF, GPIO_PIN_1, GPIO_PIN_SET);
+        BusDelay();
+    }
+    // STOP：SCL 高时 SDA 由低变高
+    HAL_GPIO_WritePin(GPIOF, GPIO_PIN_1, GPIO_PIN_RESET);
+    BusDelay();
+    HAL_GPIO_WritePin(GPIOF, GPIO_PIN_0, GPIO_PIN_RESET);
+    BusDelay();
+    HAL_GPIO_WritePin(GPIOF, GPIO_PIN_1, GPIO_PIN_SET);
+    BusDelay();
+    HAL_GPIO_WritePin(GPIOF, GPIO_PIN_0, GPIO_PIN_SET);
+    BusDelay();
+
+    __HAL_RCC_I2C2_FORCE_RESET();
+    __HAL_RCC_I2C2_RELEASE_RESET();
+    HAL_I2C_Init(&hi2c2); // MspInit 把引脚改回 I2C 复用开漏
+    // 每秒最多报一次，带上这段时间里一共复位了几次
+    static uint32_t recover_count = 0;
+    static uint32_t last_report_ms = 0;
+    ++recover_count;
+    const uint32_t now = HAL_GetTick();
+    if (last_report_ms == 0 || now - last_report_ms >= 1000U)
+    {
+        const uint32_t count = recover_count > 0xFFFU ? 0xFFFU : recover_count;
+        Event_Post(EV_WARN_I2C_BUS_RESET, static_cast<int32_t>((count << 20) | ((sr1 & 0xFFFU) << 8) | (sr2 & 0xFFU)));
+        recover_count = 0;
+        last_report_ms = now;
+    }
+    return true;
+}
+
 // Enable the I2C bus on `channel`.
 // 开通第 channel 路的I2C 
 ExtensionResult TCA_SetChannel(uint8_t channel)
@@ -34,7 +103,7 @@ ExtensionResult TCA_SetChannel(uint8_t channel)
     }
     uint8_t data;
     data = 0x01 << channel;
-    return ConvertHalStatus(HAL_I2C_Master_Transmit(&hi2c2, (TCA9548A_ADDR << 1) | 0x01, &data, 1, 0xffff));
+    return ConvertHalStatus(HAL_I2C_Master_Transmit(&hi2c2, (TCA9548A_ADDR << 1) | 0x01, &data, 1, EXT_I2C_TIMEOUT_MS));
     //HAL_I2C_Master_Transmit(&hi2c2, TCA9548A_ADDR, &data, 1, 0xffff);
 }
 
@@ -47,9 +116,9 @@ ExtensionResult PCA_Read(uint8_t startAddress,uint8_t *value)
     uint8_t buffer[1];
     tx[0] = startAddress;
     ExtensionResult result;
-    result = ConvertHalStatus(HAL_I2C_Master_Transmit(&hi2c2,PCA9685_ADDR,tx,1,10000));
+    result = ConvertHalStatus(HAL_I2C_Master_Transmit(&hi2c2,PCA9685_ADDR,tx,1,EXT_I2C_TIMEOUT_MS));
     if (result != ExtensionResult::Ok) return result;
-    result = ConvertHalStatus(HAL_I2C_Master_Receive(&hi2c2,PCA9685_ADDR,buffer,1,10000));
+    result = ConvertHalStatus(HAL_I2C_Master_Receive(&hi2c2,PCA9685_ADDR,buffer,1,EXT_I2C_TIMEOUT_MS));
     if (result != ExtensionResult::Ok) return result;
     *value = buffer[0];
     return ExtensionResult::Ok;
@@ -62,7 +131,7 @@ ExtensionResult PCA_Write(uint8_t startAddress, uint8_t buffer)
     uint8_t tx[2];
     tx[0] = startAddress;
     tx[1] = buffer;
-    return ConvertHalStatus(HAL_I2C_Master_Transmit(&hi2c2,PCA9685_ADDR, tx,2,10000));
+    return ConvertHalStatus(HAL_I2C_Master_Transmit(&hi2c2,PCA9685_ADDR, tx,2,EXT_I2C_TIMEOUT_MS));
     // Use the HAL I2C communication function to write the value to the register address. //利用HAL库的I2C通讯函数对寄存器地址写值
 }
 
@@ -120,7 +189,7 @@ ExtensionResult PCA_Setpwm(uint8_t num, uint32_t on, uint32_t off)
     tx[3] = static_cast<uint8_t>(off & 0xff);
     tx[4] = static_cast<uint8_t>((off >> 8) & 0x0f);
 
-    return ConvertHalStatus(HAL_I2C_Master_Transmit(&hi2c2,PCA9685_ADDR,tx,5,10000));
+    return ConvertHalStatus(HAL_I2C_Master_Transmit(&hi2c2,PCA9685_ADDR,tx,5,EXT_I2C_TIMEOUT_MS));
 }
 
 

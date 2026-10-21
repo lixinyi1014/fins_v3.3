@@ -36,7 +36,8 @@ float PID::PIDCalc(float target,float feedback) {
     PIDInfo.ref = target;
     PIDInfo.err[3] = PIDInfo.ref - PIDInfo.fdb;
     PIDInfo.componentKp = PIDInfo.err[3] * PIDInfo.kp;
-    PIDInfo.errSum += PIDInfo.err[3];
+    if (!PIDInfo.integralHold)
+        PIDInfo.errSum += PIDInfo.err[3];
     INRANGE(PIDInfo.errSum, -1 * PIDInfo.componentKiMax / PIDInfo.ki, PIDInfo.componentKiMax / PIDInfo.ki);
 
     PIDInfo.componentKi = PIDInfo.errSum * PIDInfo.ki;

@@ -137,6 +137,18 @@ private:
     bool feedback_fusion_ = false;
     /* 积分暂停（2026-10-20，见 Propeller.cpp kIntegralHoldAfter_ms） */
     float last_target_depth_ = 0.0f;
+    /* 深度 D（2026-10-21，见 Propeller.cpp kDepthKd） */
+    float depth_rate_mbar_s_ = 0.0f;   // 深度变化速度，往深处为正
+    float depth_d_us_ = 0.0f;          // 深度 D 项（us），遥测 $PD 的"深度 D"
+    float last_depth_fb_ = 0.0f;
+    uint32_t last_depth_ms_ = 0;
+    bool depth_rate_valid_ = false;
+    void UpdateDepthRate(float depth_mbar, uint32_t now_ms);
+    /* 平动前馈（2026-10-21，见 Propeller.cpp kFfFront 等）：当前已叠加到深度/俯仰/横滚控制量上的值（us） */
+    float ff_depth_us_ = 0.0f;
+    float ff_pitch_us_ = 0.0f;
+    float ff_roll_us_ = 0.0f;
+    uint32_t ff_last_ms_ = 0;
     uint32_t target_change_ms_ = 0;
     uint32_t motion_active_ms_ = 0;
     bool motion_seen_ = false;

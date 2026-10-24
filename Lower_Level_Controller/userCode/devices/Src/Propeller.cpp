@@ -25,6 +25,22 @@ constexpr float kSensorHalfY_m = 0.0691f;
 // 这些时候的误差是暂时的（拖缆、推力线不过重心），积进去松手后会过冲。6 mbar 时 P 已有 60 us，够顶住悬停所需
 constexpr uint32_t kIntegralHoldAfter_ms = 800;
 constexpr float kDepthIntegralBand_mbar = 6.0f;
+// 深度 D（2026-10-21）：D = -kDepthKd × 深度变化速度（mbar/s，往深处为正）。
+// 速度只在拿到新深度时按真实时间间隔算，再按 kDepthRateTau_s 平滑；只看车本身的运动，改目标深度不会打脉冲。
+// 原来 kd=10 是 150 Hz 下"本次误差-上次误差"，深度 50 Hz 才更新，折合约 0.07 us/(mbar/s)，等于没有
+constexpr float kDepthKd = 2.0f;            // us / (mbar/s)
+constexpr float kDepthRateTau_s = 0.15f;    // 平滑时间常数 s
+constexpr float kDepthDMax = 50.0f;         // D 项限幅 us
+// 平动前馈（2026-10-21）：前后左右平动时，直接给垂直推进器加一个固定量（us），抵消电压下降、推力线不过重心、
+// 拖缆带来的稳定偏差（原来只能靠 P 顶，深度会偏 2.5~3 mbar、俯仰偏 3~6°）。
+// 数值取 10-21 两次数据里各方向平动时 P 项的平均输出，正负号与遥测里的深度/俯仰/横滚控制量相同。
+// 指令开始后按 kMotionFfRate_us_s 斜坡加上，松手（或换方向）后同样斜坡撤掉；旋转、悬停不加。
+struct MotionFeedforward { float depth; float pitch; float roll; };
+constexpr MotionFeedforward kFfFront = {-28.0f,  25.0f,  0.0f};  // 前进
+constexpr MotionFeedforward kFfBack  = {-30.0f, -20.0f,  0.0f};  // 后退
+constexpr MotionFeedforward kFfLeft  = {-25.0f,  10.0f,  0.0f};  // 左移
+constexpr MotionFeedforward kFfRight = {-27.0f,   0.0f, -2.0f};  // 右移
+constexpr float kMotionFfRate_us_s = 75.0f; // 斜坡速度：每秒最多变化 75 us（30 us 约 0.4 s 加满）
 }
 
 // V33
@@ -90,6 +106,7 @@ std::array<int32_t, 4> AntiClockwisePWM = {
     InitPWM - Sign[OutID[3]] * rotate_speed
 };
 // PID
+// 深度：kd 置 0，D 改由 float_ctrl 对深度变化速度单独计算（见 kDepthKd），其余不变
 PID_Regulator_t DepthPID(10, 0.02, 10, 100, 50, 50, 200);
 PID_Regulator_t PitchPID(10, 0.02, 50, 50, 25, 25, 100);
 PID_Regulator_t RollPID(1.8, 0.02, 100, 50, 25, 25, 100);
@@ -439,6 +456,11 @@ void Propeller_I2C::ResetVerticalControl()
     Target_roll_v = 0.0f;
     Target_pitch_v = 0.0f;
     PWM_component.Depth = PWM_component.Roll = PWM_component.Pitch = 0.0f;
+    depth_rate_mbar_s_ = 0.0f;
+    depth_d_us_ = 0.0f;
+    depth_rate_valid_ = false;
+    ff_depth_us_ = ff_pitch_us_ = ff_roll_us_ = 0.0f;
+    ff_last_ms_ = 0;
 }
 
 void Propeller_I2C::ResetHorizontalControl()
@@ -520,7 +542,7 @@ int Propeller_I2C::FormatPidFields(char *buf, int size)
 {
     /*
      * 把控制量拆成各项的贡献（单位 us，和 $PL 里的深度/横滚/俯仰控制量同号、可以直接相加）：
-     *   深度控制量 = P + I + D（DepthPID 本身的三项）
+     *   深度控制量 = P + I + D（P、I 来自 DepthPID；D 按深度变化速度单独算，见 kDepthKd）
      *   横滚/俯仰控制量 = 内环kp × (外环P + 外环I + 外环D) + 内环kp × (-角速度反馈)
      * 最后一项就是内环的角速度阻尼。外环输出的三项已是各自限幅后的值；内环限幅（P 上限 100、总输出 200）只在打满时才让总和对不上。
      * 外环 50 Hz 更新，内环 150 Hz；这里取发送时刻的值。闭环没开时全为 0。
@@ -537,7 +559,7 @@ int Propeller_I2C::FormatPidFields(char *buf, int size)
     const float kr = RollInPID.PIDInfo.kp;
     const float kp = PitchInPID.PIDInfo.kp;
     return snprintf(buf, size, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
-                    us10(d.componentKp), us10(d.componentKi), us10(d.componentKd),
+                    us10(d.componentKp), us10(d.componentKi), us10(depth_d_us_),
                     us10(kr * ro.componentKp), us10(kr * ro.componentKi), us10(kr * ro.componentKd),
                     us10(-kr * RollInPID.PIDInfo.fdb),
                     us10(kp * po.componentKp), us10(kp * po.componentKi), us10(kp * po.componentKd),
@@ -595,6 +617,40 @@ int Propeller_I2C::FormatStatusFields(char *buf, int size)
                     feedback_fusion_ ? 1 : 0); // 最后一项：闭环反馈来源 0=水压差 1=ESKF
 }
 
+// 深度变化速度（mbar/s，往深处为正）：深度值变了才更新（水压 50 Hz 一帧），按真实间隔求斜率后一阶平滑
+void Propeller_I2C::UpdateDepthRate(float depth_mbar, uint32_t now_ms)
+{
+    if (!isfinite(depth_mbar))
+        return;
+    if (!depth_rate_valid_)
+    {
+        depth_rate_valid_ = true;
+        last_depth_fb_ = depth_mbar;
+        last_depth_ms_ = now_ms;
+        depth_rate_mbar_s_ = 0.0f;
+        return;
+    }
+    const uint32_t gap_ms = now_ms - last_depth_ms_;
+    if (depth_mbar == last_depth_fb_)
+    {
+        if (gap_ms > 200U) // 0.2 s 没有新深度（水压计读不到）：不再用旧速度
+            depth_rate_mbar_s_ = 0.0f;
+        return;
+    }
+    if (gap_ms <= 200U)
+    {
+        const float dt = (gap_ms < 5U ? 5U : gap_ms) * 0.001f;
+        const float raw = (depth_mbar - last_depth_fb_) / dt;
+        depth_rate_mbar_s_ += (raw - depth_rate_mbar_s_) * (dt / (kDepthRateTau_s + dt));
+    }
+    else
+    {
+        depth_rate_mbar_s_ = 0.0f; // 断了很久：只重新起算
+    }
+    last_depth_fb_ = depth_mbar;
+    last_depth_ms_ = now_ms;
+}
+
 void Propeller_I2C::float_ctrl()
 {
         constexpr float pressure_to_depth_m_per_mbar = 100.0f / (1000.0f * 9.80665f);
@@ -633,7 +689,11 @@ void Propeller_I2C::float_ctrl()
                                         !(fabsf(Target_depth - depth_feedback_mbar) <= kDepthIntegralBand_mbar);
         PitchOutPID.PIDInfo.integralHold = motion_hold;
 
-        PWM_component.Depth = DepthPID.PIDCalc(Target_depth, depth_feedback_mbar);
+        UpdateDepthRate(depth_feedback_mbar, now_ms);
+        depth_d_us_ = std::max(-kDepthDMax, std::min(kDepthDMax, -kDepthKd * depth_rate_mbar_s_)); // 往下沉（速度>0）时多给向上
+        const float depth_out_max = DepthPID.PIDInfo.outputMax;
+        PWM_component.Depth = std::max(-depth_out_max, std::min(depth_out_max,
+                                       DepthPID.PIDCalc(Target_depth, depth_feedback_mbar) + depth_d_us_));
 
         // pid for roll and pitch
         // `ps_state` sets the frequency ratio between the outer and inner control loops to 3:1. //ps_state控制双环频率比为3:1
@@ -652,6 +712,30 @@ void Propeller_I2C::float_ctrl()
         // PWM_component.Roll = RollInPID.PIDCalc(Target_roll_v, IMU::imu.attitude.roll_v); // IMU
         PWM_component.Roll = RollInPID.PIDCalc(Target_roll_v, IMU::imu.attitude.neg_roll_v); 
         PWM_component.Pitch = PitchInPID.PIDCalc(Target_pitch_v, IMU::imu.attitude.pitch_v);
+
+        // 平动前馈：按当前指令选目标值，已加上的量按斜坡靠近目标，再叠加到三个控制量上（限幅与 PID 输出相同 ±200）
+        MotionFeedforward ff_target = {0.0f, 0.0f, 0.0f};
+        switch (motion_state)
+        {
+        case FRONT: ff_target = kFfFront; break;
+        case BACK:  ff_target = kFfBack;  break;
+        case LEFT:  ff_target = kFfLeft;  break;
+        case RIGHT: ff_target = kFfRight; break;
+        default: break; // 停止、悬停、旋转：不加
+        }
+        const uint32_t ff_dt_ms = (ff_last_ms_ == 0) ? 0U : std::min<uint32_t>(now_ms - ff_last_ms_, 50U);
+        ff_last_ms_ = now_ms;
+        const float ff_step = kMotionFfRate_us_s * ff_dt_ms * 0.001f;
+        auto slew = [ff_step](float current, float target) -> float {
+            return current + std::max(-ff_step, std::min(ff_step, target - current));
+        };
+        ff_depth_us_ = slew(ff_depth_us_, ff_target.depth);
+        ff_pitch_us_ = slew(ff_pitch_us_, ff_target.pitch);
+        ff_roll_us_ = slew(ff_roll_us_, ff_target.roll);
+        auto clamp200 = [](float v) -> float { return std::max(-200.0f, std::min(200.0f, v)); };
+        PWM_component.Depth = clamp200(PWM_component.Depth + ff_depth_us_);
+        PWM_component.Pitch = clamp200(PWM_component.Pitch + ff_pitch_us_);
+        PWM_component.Roll = clamp200(PWM_component.Roll + ff_roll_us_);
 }
 
 void Propeller_I2C::speed_ctrl()
